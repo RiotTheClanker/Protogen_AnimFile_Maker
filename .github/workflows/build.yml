@@ -1,0 +1,61 @@
+name: Build Executables
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:  # allows manual trigger from GitHub UI
+
+jobs:
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies (tkinter + audio)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk portaudio19-dev
+
+      - name: Install Python dependencies
+        run: |
+          pip install pyinstaller numpy pyaudio
+
+      - name: Build Linux binary
+        run: |
+          pyinstaller --onefile --windowed protogen_tool.py
+
+      - name: Upload Linux binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: protogen-tool-linux
+          path: dist/protogen_tool
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          pip install pyinstaller numpy pyaudio
+
+      - name: Build Windows executable
+        run: |
+          pyinstaller --onefile --windowed protogen_tool.py
+
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: protogen-tool-windows
+          path: dist/protogen_tool.exe

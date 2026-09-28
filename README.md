@@ -10,8 +10,15 @@ python protogen_tool.py
 ```
 
 On Linux you may also need `sudo apt install python3-tk portaudio19-dev`.
-Prebuilt Windows / macOS / Linux executables are produced by the
-**Build Executables** GitHub Actions workflow.
+Prebuilt Windows / macOS / Linux executables are on the
+[Releases](https://github.com/RiotTheClanker/Protogen_AnimFile_Maker/releases) page.
+
+### Releasing
+
+Add notes as `docs/releases/<version>.md`, then either push a tag (`git tag V4 && git push origin V4`)
+or open **Actions → Release → Run workflow** on `main` and enter the version. The workflow
+builds all three platforms and publishes `Windows_protogen_tool.exe`, `Mac_protogen_tool` and
+`Linux_protogen_tool`. Keep those names, because the website's download buttons find the files by them.
 
 ## Layouts
 

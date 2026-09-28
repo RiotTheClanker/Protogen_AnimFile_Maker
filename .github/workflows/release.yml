@@ -1,0 +1,102 @@
+name: Release
+
+# Builds the tool for Windows, macOS and Linux and publishes a GitHub release.
+# Start it by pushing a version tag (e.g. V3), or from the Actions tab with
+# "Run workflow" on main, entering the version — the tag is then created on
+# the current main commit.
+#
+# Asset names must keep their Windows_ / Mac_ / Linux_ prefixes: the website's
+# download buttons find the files by those prefixes.
+on:
+  push:
+    tags: [ 'V*' ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. V3)'
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  VERSION: ${{ inputs.version || github.ref_name }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    # Manual releases only from main
+    if: github.event_name == 'push' || github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            built: dist/protogen_tool
+            asset: Linux_protogen_tool
+          - os: macos-latest
+            built: dist/protogen_tool
+            asset: Mac_protogen_tool
+          - os: windows-latest
+            built: dist/protogen_tool.exe
+            asset: Windows_protogen_tool.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk portaudio19-dev
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install portaudio
+
+      - name: Install Python dependencies
+        run: pip install pyinstaller numpy pyaudio
+
+      - name: Build
+        run: pyinstaller --onefile --windowed protogen_tool.py
+
+      - name: Rename
+        shell: bash
+        run: |
+          mkdir -p out
+          cp "${{ matrix.built }}" "out/${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.asset }}
+          path: out/${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: out
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="docs/releases/${VERSION}.md"
+          if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --generate-notes; fi
+          # --target creates the tag on this commit when it doesn't exist yet
+          # (manual runs); for a pushed tag it already points here.
+          gh release create "$VERSION" out/* \
+            --title "Protogen Animation Tool ${VERSION}" \
+            --target "$GITHUB_SHA" "$@"

@@ -37,6 +37,11 @@ keeps your artwork, matched panel by panel (eyes → eyes, mouth → mouth, nose
   **Mirror to other side** (on by default) paints the same pixel on the matching panel of
   the other side. **Copy side 1 → side 2** copies a whole side. Without one of these,
   side 2 (the right-hand LED chain) stays black.
+  Tick **Flip left↔right when mirroring** if side 2 should be a mirror image of side 1:
+  pixels are flipped horizontally and the panel order within each region is reversed
+  (left eye ↔ right eye, first mouth panel ↔ last). Leave it off if both sides should show
+  the same image in the same orientation. Which one you need depends on how the panels are
+  mounted and wired.
 
   Frames are either *Timed* (shown for `duration_ms`) or *Sound triggered* (advance when the
   volume rises past 128, after at least `duration_ms`).

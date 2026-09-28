@@ -15,7 +15,8 @@ Layout modes
                              Plain side (right chain, GP3): EYE(6,7)  MOUTH[8-10]
 
 Both sides are drawn in the Painter / Simulator (first side on top, second
-side below).  Tick "Mirror to other side" to paint both sides at once.
+side below).  Tick "Mirror to other side" to paint both sides at once, and
+"Flip left↔right" if side 2 should be a mirror image of side 1.
 
 The layout is selected in the toolbar and stored in the .anim file header
 byte 5 (panel count: 14 or 11).  It must match PROTOGEN_LAYOUT in the
@@ -149,10 +150,23 @@ def _role_panel(layout, side_idx, role, i):
     panels = side[role]
     return panels[i] if i < len(panels) else None
 
-def mirror_panel_map(layout):
-    """Map each panel to its counterpart on the other side (or None)."""
-    return {p: _role_panel(layout, 1 - si, role, i)
-            for p, (si, role, i) in _panel_roles(layout).items()}
+def mirror_panel_map(layout, flip=False):
+    """
+    Map each panel to its counterpart on the other side (or None).
+    With flip=True the panel order within each region is reversed
+    (left eye ↔ right eye, first mouth panel ↔ last), as for a mirror image.
+    """
+    out = {}
+    for p, (si, role, i) in _panel_roles(layout).items():
+        other = 1 - si
+        if flip and role != 'nose':
+            n = len(layout['SIDES'][other][role])
+            i = n - 1 - i
+            if i < 0:
+                out[p] = None
+                continue
+        out[p] = _role_panel(layout, other, role, i)
+    return out
 
 def remap_leds(leds, src_layout, dst_layout):
     """
@@ -408,6 +422,7 @@ class PainterTab:
         self.linear_b    = tk.DoubleVar(value=2.0)
         self.eraser      = tk.BooleanVar(value=False)
         self.mirror      = tk.BooleanVar(value=True)
+        self.flip        = tk.BooleanVar(value=False)
 
         self._build_canvas()
         self._build_controls()
@@ -417,7 +432,8 @@ class PainterTab:
     def _build_canvas(self):
         cell = fit_cell_size(self.frame, self.CELL)
         self._led_rects, cw, ch, self._titles = build_led_rects(cell, self.GAP)
-        self._mirror_map = mirror_panel_map(_L)
+        self._mirror_maps = {False: mirror_panel_map(_L, flip=False),
+                             True:  mirror_panel_map(_L, flip=True)}
         self.canvas = tk.Canvas(self.frame, width=cw, height=ch,
                                 bg='#0d0d1a', highlightthickness=0)
         self.canvas.pack(side=tk.LEFT, padx=8, pady=8, anchor='n')
@@ -464,6 +480,8 @@ class PainterTab:
         tk.Checkbutton(ctrl, text="Eraser", variable=self.eraser,
                        bg='#1a1a2e', fg='white', selectcolor='#16213e').pack(anchor='w')
         tk.Checkbutton(ctrl, text="Mirror to other side", variable=self.mirror,
+                       bg='#1a1a2e', fg='white', selectcolor='#16213e').pack(anchor='w')
+        tk.Checkbutton(ctrl, text="  Flip left↔right when mirroring", variable=self.flip,
                        bg='#1a1a2e', fg='white', selectcolor='#16213e').pack(anchor='w')
 
         # Sound
@@ -583,10 +601,20 @@ class PainterTab:
         return [r, g, b, sm, param]
 
     def _mirror_flat(self, flat):
-        """Same x/y position on the matching panel of the other side."""
+        """
+        Matching LED on the other side: same x/y on the matching panel, or,
+        with "Flip" ticked, the left-right mirror image (panel order within
+        each region reversed and x → 7-x).
+        """
+        flip = self.flip.get()
         panel, pix = divmod(flat, LEDS_PER_PANEL)
-        other = self._mirror_map.get(panel)
-        return None if other is None else panel_offset(other) + pix
+        other = self._mirror_maps[flip].get(panel)
+        if other is None:
+            return None
+        if flip:
+            y, x = divmod(pix, 8)
+            pix = y * 8 + (7 - x)
+        return panel_offset(other) + pix
 
     def _on_paint(self, event):
         flat = next((self._item_to_flat[i]
@@ -675,13 +703,15 @@ class PainterTab:
 
     def _copy_side_to_other(self):
         leds = self.frames[self.current]
-        for p in (_L['SIDES'][0]['eyes'] + _L['SIDES'][0]['mouth']
-                  + [_L['SIDES'][0]['nose']]):
-            q = self._mirror_map.get(p)
-            if p is None or q is None:
+        side = _L['SIDES'][0]
+        for p in side['eyes'] + side['mouth'] + [side['nose']]:
+            if p is None:
                 continue
             for i in range(LEDS_PER_PANEL):
-                leds[panel_offset(q) + i] = list(leds[panel_offset(p) + i])
+                src = panel_offset(p) + i
+                dst = self._mirror_flat(src)
+                if dst is not None:
+                    leds[dst] = list(leds[src])
         self._draw_all()
 
     # ── Color ─────────────────────────────────────────────────────────────────

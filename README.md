@@ -20,6 +20,9 @@ or open **Actions → Release → Run workflow** on `main` and enter the version
 builds all three platforms and publishes `Windows_protogen_tool.exe`, `Mac_protogen_tool` and
 `Linux_protogen_tool`. Keep those names, because the website's download buttons find the files by them.
 
+The window opens sized to fit your screen and can be resized: the face scales to fill the
+space, and the control columns scroll (scrollbar or mouse wheel) when the window is short.
+
 ## Layouts
 
 Choose the layout in the toolbar. It **must match `PROTOGEN_LAYOUT` in the firmware**

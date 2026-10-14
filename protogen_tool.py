@@ -245,15 +245,20 @@ def load_anim(path):
 # ── Shared canvas layout builder ──────────────────────────────────────────────
 SIDE_LABEL_H = 16    # vertical space reserved for each side's title
 
-def fit_cell_size(widget, preferred):
-    """Shrink the LED cell size so both sides fit on the screen vertically."""
-    try:
-        screen_h = widget.winfo_screenheight()
-    except tk.TclError:
-        return preferred
-    # 4 panel rows (2 per side) + gaps/labels + window chrome
-    avail = screen_h - 260
-    return max(8, min(preferred, avail // 34))
+MIN_CELL = 4         # smallest LED square the canvases shrink to
+MAX_CELL = 40        # largest LED square the canvases grow to
+
+def gap_for_cell(cell, max_gap):
+    """Spacing between panels, shrunk along with small LED cells."""
+    return min(max_gap, max(10, cell))
+
+def fit_cell_to(width, height, max_gap):
+    """Largest LED cell size whose layout fits in width × height pixels."""
+    for cell in range(MAX_CELL, MIN_CELL, -1):
+        _, w, h, _ = build_led_rects(cell, gap_for_cell(cell, max_gap))
+        if w <= width and h <= height:
+            return cell
+    return MIN_CELL
 
 def build_led_rects(cell, gap):
     """
@@ -330,6 +335,111 @@ def draw_region_outlines(canvas, led_rects, titles=()):
                                fill=color, font=('Helvetica', 8, 'bold'))
 
 
+# ── Window fitting helpers ────────────────────────────────────────────────────
+class ScrollFrame(tk.Frame):
+    """
+    A frame with a vertical scrollbar.  Pack children into `.inner`; when they
+    are taller than the window, scroll with the scrollbar or the mouse wheel.
+    """
+    def __init__(self, parent, bg, width=None):
+        super().__init__(parent, bg=bg)
+        self._canvas = tk.Canvas(self, bg=bg, highlightthickness=0,
+                                 width=width or 10)
+        self._bar = tk.Scrollbar(self, orient=tk.VERTICAL,
+                                 command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=self._bar.set)
+        self._bar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.inner = tk.Frame(self._canvas, bg=bg)
+        self._win = self._canvas.create_window(0, 0, window=self.inner, anchor='nw')
+        self.inner.bind('<Configure>', self._on_inner_resize)
+        self._canvas.bind('<Configure>', self._on_canvas_resize)
+        # Wheel scrolling only while the pointer is over this column
+        self.bind('<Enter>', lambda e: self._bind_wheel(True))
+        self.bind('<Leave>', lambda e: self._bind_wheel(False))
+
+    def _on_inner_resize(self, _event):
+        self._canvas.configure(scrollregion=self._canvas.bbox('all'))
+
+    def _on_canvas_resize(self, event):
+        # Children fill the visible width
+        self._canvas.itemconfig(self._win, width=event.width)
+
+    def _bind_wheel(self, on):
+        if on:
+            self.bind_all('<MouseWheel>', self._on_wheel)     # Windows / macOS
+            self.bind_all('<Button-4>', self._on_wheel)       # Linux
+            self.bind_all('<Button-5>', self._on_wheel)
+        else:
+            for seq in ('<MouseWheel>', '<Button-4>', '<Button-5>'):
+                self.unbind_all(seq)
+
+    def _on_wheel(self, event):
+        if self.inner.winfo_reqheight() <= self._canvas.winfo_height():
+            return   # everything already fits
+        if getattr(event, 'num', None) == 4:
+            step = -1
+        elif getattr(event, 'num', None) == 5:
+            step = 1
+        elif abs(event.delta) >= 120:
+            step = -int(event.delta / 120)               # Windows
+        else:
+            step = -1 if event.delta > 0 else 1          # macOS
+        self._canvas.yview_scroll(step, 'units')
+
+
+class FittedLedCanvas:
+    """
+    LED canvas that rescales the face to fill whatever space the window gives
+    it, so the tool works on small and scaled (high-DPI) screens.  Calls
+    `redraw()` after the LED rectangles change size.
+    """
+    def __init__(self, parent, gap, redraw):
+        self.gap     = gap
+        self._redraw = redraw
+        self._after  = None
+        self.cell    = None
+        self.canvas  = tk.Canvas(parent, width=320, height=240,
+                                 bg='#0d0d1a', highlightthickness=0)
+        self.canvas.bind('<Configure>', self._on_resize)
+        self.relayout(MIN_CELL * 4)
+
+    def relayout(self, cell=None):
+        """Rebuild LED rectangles (also after a layout change)."""
+        if cell is None:
+            cell = self.cell or MIN_CELL * 4
+        self.cell = cell
+        self.rects, _, _, self.titles = build_led_rects(
+            cell, gap_for_cell(cell, self.gap))
+
+    def _on_resize(self, _event):
+        # Coalesce the burst of events a window drag produces
+        if self._after is not None:
+            self.canvas.after_cancel(self._after)
+        self._after = self.canvas.after(40, self._apply_size)
+
+    def _apply_size(self):
+        self._after = None
+        cell = fit_cell_to(self.canvas.winfo_width(), self.canvas.winfo_height(),
+                           self.gap)
+        if cell != self.cell:
+            self.relayout(cell)
+            self._redraw()
+
+
+def fit_window_to_screen(root, pref_w=1400, pref_h=1000):
+    """Size and place the main window so it is entirely on screen."""
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    # Leave room for the title bar and the taskbar / dock / menu bar
+    w = max(480, min(pref_w, sw - 40))
+    h = max(360, min(pref_h, sh - 120))
+    x = max(0, (sw - w) // 2)
+    y = max(0, (sh - h) // 2 - 30)
+    root.geometry(f"{w}x{h}+{x}+{y}")
+    root.minsize(min(w, 640), min(h, 420))
+
+
 # ── Mic monitor ───────────────────────────────────────────────────────────────
 class MicMonitor:
     def __init__(self):
@@ -402,7 +512,6 @@ def apply_sound(led, vol):
 # TAB 1 – Painter
 # ─────────────────────────────────────────────────────────────────────────────
 class PainterTab:
-    CELL = 28
     GAP  = 20
 
     def __init__(self, parent, ensure_layout):
@@ -429,28 +538,24 @@ class PainterTab:
         self.new_frame()
 
     # ── Canvas ────────────────────────────────────────────────────────────────
+    # The canvas is packed by _build_controls(), after the controls column,
+    # so a narrow window squeezes the face rather than hiding the controls.
     def _build_canvas(self):
-        cell = fit_cell_size(self.frame, self.CELL)
-        self._led_rects, cw, ch, self._titles = build_led_rects(cell, self.GAP)
         self._mirror_maps = {False: mirror_panel_map(_L, flip=False),
                              True:  mirror_panel_map(_L, flip=True)}
-        self.canvas = tk.Canvas(self.frame, width=cw, height=ch,
-                                bg='#0d0d1a', highlightthickness=0)
-        self.canvas.pack(side=tk.LEFT, padx=8, pady=8, anchor='n')
+        self._fit = FittedLedCanvas(self.frame, self.GAP, self._draw_all)
+        self.canvas = self._fit.canvas
         self.canvas.bind('<Button-1>', self._on_paint)
         self.canvas.bind('<B1-Motion>', self._on_paint)
         self._canvas_items = {}
         self._item_to_flat = {}
 
     def rebuild_canvas(self, old_layout):
-        """Call after layout change to resize and redraw canvas."""
-        self.canvas.destroy()
-        self._canvas_items.clear()
-        self._build_canvas()
-        # Canvas must stay left of the controls panel
-        self.canvas.pack_forget()
-        self.canvas.pack(side=tk.LEFT, padx=8, pady=8, anchor='n',
-                         before=self._ctrl)
+        """Call after layout change to rebuild and redraw the canvas."""
+        self._mirror_maps = {False: mirror_panel_map(_L, flip=False),
+                             True:  mirror_panel_map(_L, flip=True)}
+        self._fit.relayout()
+        self._fit._apply_size()
         # Carry existing artwork across, matching panels by role
         self.frames = [remap_leds(leds, old_layout, _L) for leds in self.frames]
         if not self.frames:
@@ -462,10 +567,12 @@ class PainterTab:
 
     # ── Controls ─────────────────────────────────────────────────────────────
     def _build_controls(self):
-        ctrl = tk.Frame(self.frame, bg='#1a1a2e', width=230)
-        ctrl.pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=8)
-        ctrl.pack_propagate(False)
-        self._ctrl = ctrl
+        # Scrolls when the window is too short to show every control
+        scroll = ScrollFrame(self.frame, bg='#1a1a2e', width=230)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y, padx=8, pady=8)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
+        ctrl = scroll.inner
+        self._ctrl = scroll
 
         def section(t):
             tk.Label(ctrl, text=t, bg='#1a1a2e', fg='#e94560',
@@ -573,14 +680,14 @@ class PainterTab:
         self._item_to_flat.clear()
 
         leds = self.frames[self.current]
-        for flat, coords in self._led_rects.items():
+        for flat, coords in self._fit.rects.items():
             r, g, b = leds[flat][0], leds[flat][1], leds[flat][2]
             item = self.canvas.create_rectangle(
                 *coords, fill=hex_color((r, g, b)), outline='#1a1a2e', width=1)
             self._canvas_items[flat] = item
             self._item_to_flat[item] = flat
 
-        draw_region_outlines(self.canvas, self._led_rects, self._titles)
+        draw_region_outlines(self.canvas, self._fit.rects, self._fit.titles)
         self.frame_label.config(text=f"Frame {self.current+1}/{len(self.frames)}")
 
     def _update_cell(self, flat):
@@ -782,7 +889,6 @@ class PainterTab:
 # TAB 2 – Simulator
 # ─────────────────────────────────────────────────────────────────────────────
 class SimulatorTab:
-    CELL = 22
     GAP  = 18
 
     def __init__(self, parent, get_painter_frames, ensure_layout):
@@ -805,35 +911,34 @@ class SimulatorTab:
         self._draw_blank()
 
     # ── Canvas ────────────────────────────────────────────────────────────────
+    # The canvas is packed by _build_controls(), after the controls column.
     def _build_canvas(self):
-        cell = fit_cell_size(self.frame, self.CELL)
-        self._led_rects, cw, ch, self._titles = build_led_rects(cell, self.GAP)
-        self.canvas = tk.Canvas(self.frame, width=cw, height=ch,
-                                bg='#0d0d1a', highlightthickness=0)
-        self.canvas.pack(side=tk.LEFT, padx=8, pady=8, anchor='n')
+        self._fit = FittedLedCanvas(self.frame, self.GAP, self._redraw)
+        self.canvas = self._fit.canvas
         self._canvas_items = {}
+
+    def _redraw(self):
+        self._draw_blank()
+        self._render_frame()
 
     def rebuild_canvas(self):
         """Call after layout change."""
         self._stop_play()
         self.frames = []
-        self.canvas.destroy()
-        self._canvas_items.clear()
-        self._build_canvas()
-        self.canvas.pack_forget()
-        self.canvas.pack(side=tk.LEFT, padx=8, pady=8, anchor='n',
-                         before=self._ctrl)
+        self._fit.relayout()
         self._draw_blank()
+        self._fit._apply_size()
         self.file_label.config(text="No file loaded")
         self.frame_label.config(text="Frame -/-")
         self.timing_label.config(text="")
 
     # ── Controls ─────────────────────────────────────────────────────────────
     def _build_controls(self):
-        ctrl = tk.Frame(self.frame, bg='#0d0d1a', width=240)
-        ctrl.pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=8)
-        ctrl.pack_propagate(False)
-        self._ctrl = ctrl
+        scroll = ScrollFrame(self.frame, bg='#0d0d1a', width=240)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y, padx=8, pady=8)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
+        ctrl = scroll.inner
+        self._ctrl = scroll
 
         def section(t):
             tk.Label(ctrl, text=t, bg='#0d0d1a', fg='#e94560',
@@ -945,11 +1050,11 @@ class SimulatorTab:
     def _draw_blank(self):
         self.canvas.delete('all')
         self._canvas_items.clear()
-        for flat, coords in self._led_rects.items():
+        for flat, coords in self._fit.rects.items():
             item = self.canvas.create_rectangle(*coords, fill='#111122',
                                                 outline='#1a1a2e', width=1)
             self._canvas_items[flat] = item
-        draw_region_outlines(self.canvas, self._led_rects, self._titles)
+        draw_region_outlines(self.canvas, self._fit.rects, self._fit.titles)
 
     def _render_frame(self):
         if not self.frames:
@@ -1091,7 +1196,9 @@ class ExportTab:
         self._build_ui()
 
     def _build_ui(self):
-        f = self.frame
+        scroll = ScrollFrame(self.frame, bg='#1a1a2e')
+        scroll.pack(fill=tk.BOTH, expand=True)
+        f = scroll.inner
         BG, FG, ACC = '#1a1a2e', 'white', '#e94560'
 
         def section(t):
@@ -1390,7 +1497,8 @@ class App:
             ).pack(side=tk.LEFT, padx=6)
 
         self._layout_info = tk.Label(toolbar, text=self._layout_info_text(),
-                                     bg='#0d0d1a', fg='#888', font=('Helvetica', 8))
+                                     bg='#0d0d1a', fg='#888', font=('Helvetica', 8),
+                                     anchor='w')
         self._layout_info.pack(side=tk.LEFT, padx=12)
 
         # ── Notebook ─────────────────────────────────────────────────────────
@@ -1414,6 +1522,7 @@ class App:
         nb.add(self.sim.frame,      text="  ▶   Simulator  ")
         nb.add(self.exporter.frame, text="  📄  Export .h  ")
 
+        fit_window_to_screen(root)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._mic_refresh()
 

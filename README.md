@@ -37,6 +37,14 @@ Both sides are drawn in the Painter and Simulator: side 1 on top, side 2 underne
 Opening a file made for the other layout offers to switch layouts. Switching layouts
 keeps your artwork, matched panel by panel (eyes → eyes, mouth → mouth, nose → nose).
 
+## Display configs (in development)
+
+The `dev` branch is moving from the fixed 11/14 layouts to display configs: JSON files that
+describe any set of panels (NeoPixel, HUB75, MAX7219). `displays/mk2.json` and
+`displays/mk3.json` describe the current helmets. The format is documented in
+[ProtoFace `docs/display-config.md`](https://github.com/RiotTheClanker/ProtoFace/blob/dev/docs/display-config.md).
+Check a config with `python display_config.py my_display.json`.
+
 ## Tabs
 
 - **🎨 Painter** — click or drag to paint LEDs. Each LED stores a colour plus a sound mode:

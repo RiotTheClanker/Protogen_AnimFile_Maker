@@ -6,30 +6,28 @@ Combines:
   • Simulator     (play back .anim with sound-reaction preview)
   • Export to .h  (convert any frame from a .anim to fallback_anim.h)
 
-Layout modes
-  Layout 14  (original)  :  7 panels per side  × 2 = 14 total
-                             Left  side (left chain,  GP2): EYE(0,1)  MOUTH[2-5]   NOSE(6)
-                             Right side (right chain, GP3): EYE(7,8)  MOUTH[9-12]  NOSE(13)
-  Layout 11  (new)       :  Nose side = 6 panels, plain side = 5 panels = 11 total
-                             Nose side  (left chain,  GP2): EYE(0,1)  MOUTH[2-4]   NOSE(5)
-                             Plain side (right chain, GP3): EYE(6,7)  MOUTH[8-10]
+Displays
+  The face layout comes from a display config (display.json, documented in
+  ProtoFace docs/display-config.md).  The Mk2 and Mk3 presets ship in
+  displays/; "Open display.json…" in the toolbar loads any other.
+  The display must match the one the ProtoFace firmware is set up for.
 
-Both sides are drawn in the Painter / Simulator (first side on top, second
-side below).  Tick "Mirror to other side" to paint both sides at once, and
-"Flip left↔right" if side 2 should be a mirror image of side 1.
-
-The layout is selected in the toolbar and stored in the .anim file header
-byte 5 (panel count: 14 or 11).  It must match PROTOGEN_LAYOUT in the
-ProtoFace firmware.
+Both sides are drawn in the Painter / Simulator.  Tick "Mirror to other
+side" to paint both sides at once, and "Flip left↔right" if side 2 should be
+a mirror image of side 1.
 
 Requires: tkinter (stdlib), numpy, pyaudio (optional – for live mic)
   pip install numpy pyaudio
 """
 
-import struct, copy, os, threading, time
+import copy, os, threading, time
 import tkinter as tk
 from tkinter import filedialog, messagebox, colorchooser, ttk
 import numpy as np
+
+import display_config as dcfg
+from anim_io import (read_anim, write_anim, remap_leds, blank_led, blank_leds,
+                     SOUND_STATIC)
 
 try:
     import pyaudio
@@ -38,13 +36,6 @@ except ImportError:
     PYAUDIO_OK = False
 
 # ── Fixed constants ───────────────────────────────────────────────────────────
-MAGIC          = b'ANIM'
-VERSION        = 0x01
-LEDS_PER_PANEL = 64
-LED_BYTES      = 5
-FRAME_HDR_SIZE = 4
-
-SOUND_STATIC = 0
 SOUND_SNAP   = 1
 SOUND_LINEAR = 2
 TIMING_TIMED = 0
@@ -56,283 +47,89 @@ TIMING_SOUND = 1
 SOUND_TRIGGER_LEVEL   = 128
 SOUND_TRIGGER_RELEASE = 96
 
-DEFAULT_LAYOUT = 11   # matches the ProtoFace firmware default
+DEFAULT_DISPLAY = 'Mk2'   # matches the ProtoFace firmware default
 
-# ── Layout descriptors ────────────────────────────────────────────────────────
-# Each layout is two "sides".  A side lists its panels by role; the first
-# side is wired to the left LED chain, the second to the right LED chain.
-# Panels are numbered in chain order: side 0 first, then side 1.
+# ── Display configs ───────────────────────────────────────────────────────────
+# Every display the tool knows about this session: the shipped presets plus
+# any display.json the user opened.  _D is the active one.
+DISPLAYS = dcfg.presets()
+_D = DISPLAYS[DEFAULT_DISPLAY]
 
-def _make_layout(panels, name, sides):
-    left  = sides[0]
-    right = sides[1]
-    def side_panels(s):
-        return s['eyes'] + s['mouth'] + ([s['nose']] if s['nose'] is not None else [])
-    return dict(
-        name           = name,
-        PANELS         = panels,
-        TOTAL_LEDS     = panels * LEDS_PER_PANEL,
-        SIDES          = sides,
-        # Legacy keys (side 0) — kept for code that only cares about one side
-        PANEL_EYE_L    = left['eyes'][0],
-        PANEL_EYE_R    = left['eyes'][1],
-        PANEL_MOUTH    = left['mouth'],
-        PANEL_NOSE     = left['nose'],
-        PANEL_EYE_L2   = right['eyes'][0],
-        PANEL_EYE_R2   = right['eyes'][1],
-        PANEL_MOUTH2   = right['mouth'],
-        # Chain split used by the firmware
-        LEDS_LEFT      = len(side_panels(left))  * LEDS_PER_PANEL,
-        LEDS_RIGHT     = len(side_panels(right)) * LEDS_PER_PANEL,
-    )
+def active():
+    return _D
 
-LAYOUTS = {
-    11: _make_layout(11, "Layout 11  (6+5, nose side + plain side)", [
-        dict(label='NOSE SIDE  (left chain)',   eyes=[0, 1], mouth=[2, 3, 4],     nose=5),
-        dict(label='PLAIN SIDE  (right chain)', eyes=[6, 7], mouth=[8, 9, 10],    nose=None),
-    ]),
-    14: _make_layout(14, "Layout 14  (7+7, original)", [
-        dict(label='LEFT SIDE  (left chain)',   eyes=[0, 1], mouth=[2, 3, 4, 5],     nose=6),
-        dict(label='RIGHT SIDE  (right chain)', eyes=[7, 8], mouth=[9, 10, 11, 12],  nose=13),
-    ]),
-}
+def set_display(cfg):
+    global _D
+    DISPLAYS[cfg.name] = cfg
+    _D = cfg
 
-# Active layout – modules read this dict.  The App overwrites it on change.
-_L = LAYOUTS[DEFAULT_LAYOUT]
-
-def set_layout(panel_count):
-    global _L
-    _L = LAYOUTS[panel_count]
-
-# Convenience accessors (always reflect current layout)
-def PANELS():          return _L['PANELS']
-def TOTAL_LEDS():      return _L['TOTAL_LEDS']
-def PANEL_EYE_L():     return _L['PANEL_EYE_L']
-def PANEL_EYE_R():     return _L['PANEL_EYE_R']
-def PANEL_MOUTH():     return _L['PANEL_MOUTH']
-def PANEL_NOSE():      return _L['PANEL_NOSE']
+def TOTAL_LEDS():
+    return _D.total_pixels
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
-def panel_offset(p):
-    return p * LEDS_PER_PANEL
-
-def xy_to_led_idx(panel, x, y):
-    return panel_offset(panel) + y * 8 + x
-
 def pack_linear(m, b):
     return (max(0, min(15, int(m))) << 4) | max(0, min(15, int(b)))
 
-def blank_led():
-    return [0, 0, 0, SOUND_STATIC, 0]
-
 def blank_led_list(n=None):
-    return [blank_led() for _ in range(TOTAL_LEDS() if n is None else n)]
+    return blank_leds(TOTAL_LEDS() if n is None else n)
 
 def hex_color(rgb):
     return '#{:02x}{:02x}{:02x}'.format(*rgb)
 
-def _panel_roles(layout):
-    """Map panel → (side_index, role, index_within_role)."""
-    roles = {}
-    for si, side in enumerate(layout['SIDES']):
-        for i, p in enumerate(side['eyes']):
-            roles[p] = (si, 'eyes', i)
-        for i, p in enumerate(side['mouth']):
-            roles[p] = (si, 'mouth', i)
-        if side['nose'] is not None:
-            roles[side['nose']] = (si, 'nose', 0)
-    return roles
+def region_groups(cfg):
+    """[(label, side, region, [panels])] in panel order, for outlines and fill buttons."""
+    groups, seen = [], {}
+    for p in cfg.panels:
+        key = (p.side, p.region if p.region is not None else p.id)
+        if key not in seen:
+            name = (p.region or p.id).upper()
+            label = f"{p.side.upper()} {name}" if p.side else name
+            seen[key] = len(groups)
+            groups.append((label, p.side, p.region, []))
+        groups[seen[key]][3].append(p)
+    return groups
 
-def _role_panel(layout, side_idx, role, i):
-    side = layout['SIDES'][side_idx]
-    if role == 'nose':
-        return side['nose']
-    panels = side[role]
-    return panels[i] if i < len(panels) else None
+REGION_COLORS = {'eye': '#4fc3f7', 'mouth': '#e94560', 'nose': '#a5d6a7'}
+EXTRA_COLORS  = ['#ffb74d', '#ce93d8', '#fff176', '#80cbc4', '#f48fb1']
 
-def mirror_panel_map(layout, flip=False):
-    """
-    Map each panel to its counterpart on the other side (or None).
-    With flip=True the panel order within each region is reversed
-    (left eye ↔ right eye, first mouth panel ↔ last), as for a mirror image.
-    """
-    out = {}
-    for p, (si, role, i) in _panel_roles(layout).items():
-        other = 1 - si
-        if flip and role != 'nose':
-            n = len(layout['SIDES'][other][role])
-            i = n - 1 - i
-            if i < 0:
-                out[p] = None
-                continue
-        out[p] = _role_panel(layout, other, role, i)
-    return out
+def region_color(region, i):
+    return REGION_COLORS.get(region, EXTRA_COLORS[i % len(EXTRA_COLORS)])
 
-def remap_leds(leds, src_layout, dst_layout):
-    """
-    Convert one frame's LED list between layouts, matching panels by role
-    (eye → eye, mouth panel n → mouth panel n, nose → nose).  Panels with
-    no counterpart in the destination are dropped; new ones start blank.
-    """
-    out = blank_led_list(dst_layout['TOTAL_LEDS'])
-    for p, (si, role, i) in _panel_roles(src_layout).items():
-        q = _role_panel(dst_layout, si, role, i)
-        if q is None:
-            continue
-        src = panel_offset(p)
-        dst = panel_offset(q)
-        for k in range(LEDS_PER_PANEL):
-            if src + k < len(leds):
-                out[dst + k] = list(leds[src + k])
-    return out
-
-# ── Binary I/O ────────────────────────────────────────────────────────────────
-def _u8(v):
-    return max(0, min(255, int(v)))
-
-def make_frame_bytes(duration_ms, timing_mode, leds):
-    """Pack one animation frame into bytes."""
-    n = TOTAL_LEDS()
-    assert len(leds) == n, f"Expected {n} LEDs, got {len(leds)}"
-    data = bytearray(struct.pack('<HBB', max(0, min(0xFFFF, int(duration_ms))),
-                                 _u8(timing_mode), 0))
-    for (r, g, b, sm, p) in leds:
-        data += bytes((_u8(r), _u8(g), _u8(b), _u8(sm), _u8(p)))
-    return bytes(data)
-
-def write_anim(path, frames_bytes):
-    panels = PANELS()
-    with open(path, 'wb') as f:
-        f.write(MAGIC)
-        f.write(struct.pack('BBBB', VERSION, panels, 0, 0))
-        for frame in frames_bytes:
-            f.write(frame)
-    print(f"Wrote {len(frames_bytes)} frames → {path}  (layout {panels})")
-
-def load_anim(path):
-    """
-    Returns (version, panels, frames) where each frame is:
-      {'duration_ms': int, 'timing_mode': int, 'leds': list-of-[r,g,b,sm,p]}
-    Automatically uses the panel count stored in the file header.
-    """
-    frames = []
-    with open(path, 'rb') as f:
-        hdr = f.read(8)
-        if len(hdr) < 8 or hdr[:4] != MAGIC:
-            raise ValueError("Not a valid .anim file")
-        version   = hdr[4]
-        panels    = hdr[5]
-        if panels not in LAYOUTS:
-            raise ValueError(f"Unknown panel count {panels} in file header "
-                             f"(supported: {sorted(LAYOUTS.keys())})")
-        total_leds = panels * LEDS_PER_PANEL
-        frame_size = FRAME_HDR_SIZE + total_leds * LED_BYTES
-        while True:
-            raw = f.read(frame_size)
-            if len(raw) < frame_size:
-                break   # ignore a truncated trailing frame (firmware does too)
-            duration_ms = struct.unpack_from('<H', raw, 0)[0]
-            timing_mode = raw[2]
-            leds = [list(raw[o:o + LED_BYTES])
-                    for o in range(FRAME_HDR_SIZE, frame_size, LED_BYTES)]
-            frames.append({
-                'duration_ms': duration_ms,
-                'timing_mode': timing_mode,
-                'leds': leds,
-            })
-    return version, panels, frames
-
-# ── Shared canvas layout builder ──────────────────────────────────────────────
-SIDE_LABEL_H = 16    # vertical space reserved for each side's title
-
-MIN_CELL = 4         # smallest LED square the canvases shrink to
+# ── Shared canvas layout ──────────────────────────────────────────────────────
+LABEL_H  = 14        # space above each row of panels for region labels
+MIN_CELL = 2         # smallest LED square the canvases shrink to
 MAX_CELL = 40        # largest LED square the canvases grow to
 
 def gap_for_cell(cell, max_gap):
-    """Spacing between panels, shrunk along with small LED cells."""
-    return min(max_gap, max(10, cell))
+    """Spacing between panel rows, shrunk along with small LED cells."""
+    return min(max_gap, max(8, cell))
+
+def geometry(cell, max_gap):
+    return dcfg.CanvasGeometry(_D, cell, gap_for_cell(cell, max_gap), LABEL_H)
 
 def fit_cell_to(width, height, max_gap):
     """Largest LED cell size whose layout fits in width × height pixels."""
     for cell in range(MAX_CELL, MIN_CELL, -1):
-        _, w, h, _ = build_led_rects(cell, gap_for_cell(cell, max_gap))
-        if w <= width and h <= height:
+        g = geometry(cell, max_gap)
+        if g.width <= width and g.height <= height:
             return cell
     return MIN_CELL
 
-def build_led_rects(cell, gap):
-    """
-    Build canvas coordinates for every LED in the current layout.
-
-    Each side is drawn as: eyes (2×8×8) top-left, nose (8×8) top-right,
-    mouth (n×8×8) underneath.  The first side (left chain) is drawn on top,
-    the second side (right chain) below it.
-    Returns (rects_dict, canvas_w, canvas_h, side_titles).
-    rects_dict maps flat_led_index → (x1, y1, x2, y2).
-    side_titles is a list of (x, y, text) for labelling each side.
-    """
-    rects  = {}
-    titles = []
-    row_h  = 8 * cell
-    max_mouth = max(len(s['mouth']) for s in _L['SIDES'])
-
-    def add_panel(panel, ox, oy):
-        for y in range(8):
-            for x in range(8):
-                flat = xy_to_led_idx(panel, x, y)
-                x1 = ox + x * cell
-                y1 = oy + y * cell
-                rects[flat] = (x1, y1, x1 + cell - 1, y1 + cell - 1)
-
-    top = gap
-    for side in _L['SIDES']:
-        titles.append((gap, top, side['label']))
-        eye_oy   = top + SIDE_LABEL_H + gap
-        mouth_ox = cell + gap
-        mouth_oy = eye_oy + row_h + gap
-        eye_ox   = mouth_ox - cell
-
-        for i, panel in enumerate(side['eyes']):
-            add_panel(panel, eye_ox + i * row_h, eye_oy)
-        for i, panel in enumerate(side['mouth']):
-            add_panel(panel, mouth_ox + i * row_h, mouth_oy)
-        if side['nose'] is not None:
-            add_panel(side['nose'], mouth_ox + len(side['mouth']) * row_h, eye_oy)
-
-        top = mouth_oy + row_h + gap * 2
-
-    canvas_w = cell + gap + (max_mouth + 1) * row_h + gap
-    canvas_h = top
-    return rects, canvas_w, canvas_h, titles
-
-
-def draw_region_outlines(canvas, led_rects, titles=()):
-    """Draw colored outlines around eye / mouth / nose regions of both sides."""
-    for x, y, text in titles:
-        canvas.create_text(x, y, text=text, anchor='nw',
-                           fill='#aaaaaa', font=('Helvetica', 9, 'bold'))
-
-    for side in _L['SIDES']:
-        regions = [
-            (side['eyes'],  '#4fc3f7', 'EYE'),
-            (side['mouth'], '#e94560', 'MOUTH'),
-        ]
-        if side['nose'] is not None:
-            regions.append(([side['nose']], '#a5d6a7', 'NOSE'))
-
-        for panels, color, label in regions:
-            rects = [led_rects[panel_offset(p) + i]
-                     for p in panels for i in range(LEDS_PER_PANEL)
-                     if panel_offset(p) + i in led_rects]
-            if not rects:
-                continue
-            x1 = min(r[0] for r in rects) - 3
-            y1 = min(r[1] for r in rects) - 3
-            x2 = max(r[2] for r in rects) + 3
-            y2 = max(r[3] for r in rects) + 3
-            canvas.create_rectangle(x1, y1, x2, y2, outline=color, width=2, fill='')
-            canvas.create_text(x1 + 4, y1 - 1, text=label, anchor='sw',
-                               fill=color, font=('Helvetica', 8, 'bold'))
+def draw_region_outlines(canvas, led_rects):
+    """Outline and label each region (eye, mouth, nose, …) on each side."""
+    for i, (label, _side, region, panels) in enumerate(region_groups(_D)):
+        rects = [led_rects[p.offset + k] for p in panels for k in range(p.count)
+                 if p.offset + k in led_rects]
+        if not rects:
+            continue
+        color = region_color(region, i)
+        x1 = min(r[0] for r in rects) - 3
+        y1 = min(r[1] for r in rects) - 3
+        x2 = max(r[2] for r in rects) + 3
+        y2 = max(r[3] for r in rects) + 3
+        canvas.create_rectangle(x1, y1, x2, y2, outline=color, width=2, fill='')
+        canvas.create_text(x1 + 4, y1 - 1, text=label, anchor='sw',
+                           fill=color, font=('Helvetica', 8, 'bold'))
 
 
 # ── Window fitting helpers ────────────────────────────────────────────────────
@@ -410,8 +207,9 @@ class FittedLedCanvas:
         if cell is None:
             cell = self.cell or MIN_CELL * 4
         self.cell = cell
-        self.rects, _, _, self.titles = build_led_rects(
-            cell, gap_for_cell(cell, self.gap))
+        self.rects = geometry(cell, self.gap).rects()
+        # Tiny cells (big HUB75 faces) lose their colour to a 1px outline
+        self.outline_width = 1 if cell > 3 else 0
 
     def _on_resize(self, _event):
         # Coalesce the burst of events a window drag produces
@@ -531,7 +329,7 @@ class PainterTab:
         self.linear_b    = tk.DoubleVar(value=2.0)
         self.eraser      = tk.BooleanVar(value=False)
         self.mirror      = tk.BooleanVar(value=True)
-        self.flip        = tk.BooleanVar(value=False)
+        self.flip        = tk.BooleanVar(value=self._default_flip())
 
         self._build_canvas()
         self._build_controls()
@@ -540,9 +338,16 @@ class PainterTab:
     # ── Canvas ────────────────────────────────────────────────────────────────
     # The canvas is packed by _build_controls(), after the controls column,
     # so a narrow window squeezes the face rather than hiding the controls.
+    @staticmethod
+    def _default_flip():
+        return bool(_D.mirror) and _D.mirror.get('flip', 'none') == 'h'
+
+    def _build_mirror_maps(self):
+        self._mirror_maps = {False: _D.mirror_map(flip='none'),
+                             True:  _D.mirror_map(flip='h')}
+
     def _build_canvas(self):
-        self._mirror_maps = {False: mirror_panel_map(_L, flip=False),
-                             True:  mirror_panel_map(_L, flip=True)}
+        self._build_mirror_maps()
         self._fit = FittedLedCanvas(self.frame, self.GAP, self._draw_all)
         self.canvas = self._fit.canvas
         self.canvas.bind('<Button-1>', self._on_paint)
@@ -550,14 +355,16 @@ class PainterTab:
         self._canvas_items = {}
         self._item_to_flat = {}
 
-    def rebuild_canvas(self, old_layout):
-        """Call after layout change to rebuild and redraw the canvas."""
-        self._mirror_maps = {False: mirror_panel_map(_L, flip=False),
-                             True:  mirror_panel_map(_L, flip=True)}
+    def rebuild_canvas(self, old_cfg):
+        """Call after a display change to rebuild and redraw the canvas."""
+        self._build_mirror_maps()
+        self.flip.set(self._default_flip())
+        self._mirror_check.config(state=tk.NORMAL if _D.mirror else tk.DISABLED)
+        self._flip_check.config(state=tk.NORMAL if _D.mirror else tk.DISABLED)
+        # Carry existing artwork across, matching panels by side and region
+        self.frames = [remap_leds(leds, old_cfg, _D) for leds in self.frames]
         self._fit.relayout()
         self._fit._apply_size()
-        # Carry existing artwork across, matching panels by role
-        self.frames = [remap_leds(leds, old_layout, _L) for leds in self.frames]
         if not self.frames:
             self.frames     = [blank_led_list()]
             self.frame_meta = [{'duration_ms': 500, 'timing_mode': TIMING_TIMED}]
@@ -586,10 +393,15 @@ class PainterTab:
         self.color_preview.pack(fill=tk.X, pady=2)
         tk.Checkbutton(ctrl, text="Eraser", variable=self.eraser,
                        bg='#1a1a2e', fg='white', selectcolor='#16213e').pack(anchor='w')
-        tk.Checkbutton(ctrl, text="Mirror to other side", variable=self.mirror,
-                       bg='#1a1a2e', fg='white', selectcolor='#16213e').pack(anchor='w')
-        tk.Checkbutton(ctrl, text="  Flip left↔right when mirroring", variable=self.flip,
-                       bg='#1a1a2e', fg='white', selectcolor='#16213e').pack(anchor='w')
+        state = tk.NORMAL if _D.mirror else tk.DISABLED
+        self._mirror_check = tk.Checkbutton(
+            ctrl, text="Mirror to other side", variable=self.mirror, state=state,
+            bg='#1a1a2e', fg='white', selectcolor='#16213e')
+        self._mirror_check.pack(anchor='w')
+        self._flip_check = tk.Checkbutton(
+            ctrl, text="  Flip left↔right when mirroring", variable=self.flip, state=state,
+            bg='#1a1a2e', fg='white', selectcolor='#16213e')
+        self._flip_check.pack(anchor='w')
 
         # Sound
         section("SOUND REACTION")
@@ -656,17 +468,10 @@ class PainterTab:
     def _build_fill_buttons(self):
         for w in self._ctrl_fill_frame.winfo_children():
             w.destroy()
-        regions = []
-        for si, side in enumerate(_L['SIDES']):
-            tag = f"side {si + 1}"
-            regions += [
-                (f"Eye ({tag})",   side['eyes']),
-                (f"Mouth ({tag})", side['mouth']),
-            ]
-            if side['nose'] is not None:
-                regions.append((f"Nose ({tag})", [side['nose']]))
-        regions.append(("All", list(range(_L['PANELS']))))
-        regions.append(("Copy side 1 → side 2", None))
+        regions = [(label.title(), panels) for label, _s, _r, panels in region_groups(_D)]
+        regions.append(("All", list(_D.panels)))
+        if _D.mirror:
+            regions.append((f"Copy {_D.mirror['from']} → {_D.mirror['to']}", None))
         for lbl, panels in regions:
             cmd = (self._copy_side_to_other if panels is None
                    else (lambda p=panels: self._fill_panels(p)))
@@ -683,11 +488,12 @@ class PainterTab:
         for flat, coords in self._fit.rects.items():
             r, g, b = leds[flat][0], leds[flat][1], leds[flat][2]
             item = self.canvas.create_rectangle(
-                *coords, fill=hex_color((r, g, b)), outline='#1a1a2e', width=1)
+                *coords, fill=hex_color((r, g, b)), outline='#1a1a2e',
+                width=self._fit.outline_width)
             self._canvas_items[flat] = item
             self._item_to_flat[item] = flat
 
-        draw_region_outlines(self.canvas, self._fit.rects, self._fit.titles)
+        draw_region_outlines(self.canvas, self._fit.rects)
         self.frame_label.config(text=f"Frame {self.current+1}/{len(self.frames)}")
 
     def _update_cell(self, flat):
@@ -711,17 +517,9 @@ class PainterTab:
         """
         Matching LED on the other side: same x/y on the matching panel, or,
         with "Flip" ticked, the left-right mirror image (panel order within
-        each region reversed and x → 7-x).
+        each region reversed and x mirrored).
         """
-        flip = self.flip.get()
-        panel, pix = divmod(flat, LEDS_PER_PANEL)
-        other = self._mirror_maps[flip].get(panel)
-        if other is None:
-            return None
-        if flip:
-            y, x = divmod(pix, 8)
-            pix = y * 8 + (7 - x)
-        return panel_offset(other) + pix
+        return self._mirror_maps[self.flip.get()].get(flat)
 
     def _on_paint(self, event):
         flat = next((self._item_to_flat[i]
@@ -803,19 +601,16 @@ class PainterTab:
         brush = self._current_brush()
         leds  = self.frames[self.current]
         for p in panels:
-            base = panel_offset(p)
-            for i in range(LEDS_PER_PANEL):
-                leds[base + i] = list(brush)
+            for i in range(p.offset, p.offset + p.count):
+                leds[i] = list(brush)
         self._draw_all()
 
     def _copy_side_to_other(self):
         leds = self.frames[self.current]
-        side = _L['SIDES'][0]
-        for p in side['eyes'] + side['mouth'] + [side['nose']]:
-            if p is None:
+        for p in _D.panels:
+            if p.side != _D.mirror['from']:
                 continue
-            for i in range(LEDS_PER_PANEL):
-                src = panel_offset(p) + i
+            for src in range(p.offset, p.offset + p.count):
                 dst = self._mirror_flat(src)
                 if dst is not None:
                     leds[dst] = list(leds[src])
@@ -836,11 +631,12 @@ class PainterTab:
         if not path:
             return
         try:
-            _, file_panels, loaded = load_anim(path)
+            anim = read_anim(path)
+            loaded = anim.frames
             if not loaded:
                 messagebox.showerror("Error", "No valid frames found.")
                 return
-            if not self._ensure_layout(file_panels):
+            if not self._ensure_layout(anim):
                 return
             self.frames     = [[list(led) for led in fr['leds']] for fr in loaded]
             self.frame_meta = [{'duration_ms': fr['duration_ms'],
@@ -860,20 +656,14 @@ class PainterTab:
         if not path:
             return
         try:
-            binary_frames = [
-                make_frame_bytes(self.frame_meta[i]['duration_ms'],
-                                 self.frame_meta[i]['timing_mode'],
-                                 [tuple(l[:5]) for l in leds])
-                for i, leds in enumerate(self.frames)
-            ]
-            write_anim(path, binary_frames)
+            write_anim(path, _D, self.get_frames_data())
         except Exception as e:
             messagebox.showerror("Error", f"Could not save:\n{e}")
             return
-        messagebox.showinfo("Saved", f"{len(binary_frames)} frames → {path}")
+        messagebox.showinfo("Saved", f"{len(self.frames)} frames for \"{_D.name}\" → {path}")
 
     def get_frames_data(self):
-        """Return frames in the same dict format used by load_anim."""
+        """Return frames in the same dict format used by read_anim."""
         self._save_meta()
         return [
             {
@@ -1021,11 +811,12 @@ class SimulatorTab:
         if not path:
             return
         try:
-            _, file_panels, frames = load_anim(path)
+            anim = read_anim(path)
+            frames = anim.frames
             if not frames:
                 messagebox.showerror("Error", "No valid frames found.")
                 return
-            if not self._ensure_layout(file_panels):
+            if not self._ensure_layout(anim):
                 return
             self._load_frames(frames)
             self.file_label.config(text=os.path.basename(path))
@@ -1052,9 +843,10 @@ class SimulatorTab:
         self._canvas_items.clear()
         for flat, coords in self._fit.rects.items():
             item = self.canvas.create_rectangle(*coords, fill='#111122',
-                                                outline='#1a1a2e', width=1)
+                                                outline='#1a1a2e',
+                                                width=self._fit.outline_width)
             self._canvas_items[flat] = item
-        draw_region_outlines(self.canvas, self._fit.rects, self._fit.titles)
+        draw_region_outlines(self.canvas, self._fit.rects)
 
     def _render_frame(self):
         if not self.frames:
@@ -1277,11 +1069,12 @@ class ExportTab:
         if not path:
             return
         try:
-            _, file_panels, frames = load_anim(path)
+            anim = read_anim(path)
+            frames = anim.frames
             if not frames:
                 messagebox.showerror("Error", "No valid frames found.")
                 return
-            if not self._ensure_layout(file_panels):
+            if not self._ensure_layout(anim):
                 return
             self._anim_frames = frames
             self._source_name = os.path.basename(path)
@@ -1320,7 +1113,7 @@ class ExportTab:
         dur   = frame['duration_ms']
         tm    = frame['timing_mode']
         leds  = frame['leds']
-        L     = _L
+        D     = _D
 
         counts = {0: 0, 1: 0, 2: 0}
         for led in leds:
@@ -1331,7 +1124,7 @@ class ExportTab:
         timing_str = (f"SOUND_TRIGGERED (hold ≥{dur} ms)" if tm == TIMING_SOUND
                       else f"TIMED ({dur} ms)")
         lines = [
-            f"Layout     : {L['PANELS']}-panel  ({L['name']})",
+            f"Display    : {D.name}  ({len(D.panels)} panels, {D.total_pixels} pixels)",
             f"Frame      : {idx + 1} of {len(self._anim_frames)}",
             f"Timing     : {timing_str}",
             f"LEDs       : {counts[0]} STATIC  |  {counts[1]} SNAP  |  {counts[2]} LINEAR",
@@ -1339,16 +1132,11 @@ class ExportTab:
         ]
 
         # Lit-LED count per region, so an empty side is obvious before export
-        for si, side in enumerate(L['SIDES']):
-            regions = [('Eye', side['eyes']), ('Mouth', side['mouth'])]
-            if side['nose'] is not None:
-                regions.append(('Nose', [side['nose']]))
-            parts = []
-            for name, panels in regions:
-                lit = sum(1 for p in panels for i in range(LEDS_PER_PANEL)
-                          if any(leds[panel_offset(p) + i][:3]))
-                parts.append(f"{name} {lit}/{len(panels) * LEDS_PER_PANEL}")
-            lines.append(f"  Side {si + 1} lit : " + "  ".join(parts))
+        for label, _side, _region, panels in region_groups(D):
+            total = sum(p.count for p in panels)
+            lit = sum(1 for p in panels for i in range(p.offset, p.offset + p.count)
+                      if any(leds[i][:3]))
+            lines.append(f"  {label + ' lit':<18}: {lit}/{total}")
 
         self.preview_text.config(state=tk.NORMAL)
         self.preview_text.delete('1.0', tk.END)
@@ -1385,8 +1173,8 @@ class ExportTab:
         if len(frame['leds']) != TOTAL_LEDS():
             messagebox.showerror(
                 "Error",
-                f"Frame has {len(frame['leds'])} LEDs but the {PANELS()}-panel "
-                f"layout needs {TOTAL_LEDS()}. Reload the source.")
+                f"Frame has {len(frame['leds'])} LEDs but the display "
+                f"\"{_D.name}\" has {TOTAL_LEDS()}. Reload the source.")
             return
         try:
             self._generate_h(frame, idx, total, self._source_name, out_path)
@@ -1395,20 +1183,17 @@ class ExportTab:
             return
         self.status_label.config(
             text=f"✓  Written → {out_path}   (frame {idx+1}/{total}, "
-                 f"layout {PANELS()})")
+                 f"display {_D.name})")
 
     def _generate_h(self, frame, frame_idx, total_frames, source_name, out_path):
-        L      = _L
-        panels = L['PANELS']
-        total  = L['TOTAL_LEDS']
+        D      = _D
+        total  = D.total_pixels
+        v1     = next((n for n in (11, 14) if D.is_v1_compatible(n)), 0)
         dur    = frame['duration_ms']
         timing = frame['timing_mode']
         leds   = frame['leds']
         timing_str = "SOUND_TRIGGERED" if timing == TIMING_SOUND else f"TIMED ({dur}ms)"
 
-        # Chain sizes for the comment header
-        chain_l = L['LEDS_LEFT']
-        chain_r = L['LEDS_RIGHT']
 
         lines = [
             '#pragma once',
@@ -1419,16 +1204,19 @@ class ExportTab:
             f'// Source    : {source_name}',
             f'// Frame     : {frame_idx + 1} of {total_frames}',
             f'// Timing    : {timing_str}',
-            f'// Layout    : {panels}-panel  (left chain={chain_l} LEDs, right chain={chain_r} LEDs)',
+            f'// Display   : {D.name}  ({len(D.panels)} panels, {total} pixels, layout ID {D.layout_id():08x})',
             '//',
             '// sound_mode : 0=STATIC  1=SNAP  2=LINEAR',
             '// param      : SNAP   → threshold 0-255',
             '//              LINEAR → high nibble=m (0-15)  low nibble=b (0-15)',
             '//',
-            '// The firmware checks FALLBACK_LAYOUT against its PROTOGEN_LAYOUT and',
-            '// refuses to build if they differ.',
+            '// The firmware checks these against its display and refuses to build',
+            '// if they differ.  FALLBACK_LAYOUT is the old 11/14 panel count',
+            '// (0 for other displays).',
             '',
-            f'#define FALLBACK_LAYOUT {panels}',
+            f'#define FALLBACK_LAYOUT    {v1}',
+            f'#define FALLBACK_PIXELS    {total}',
+            f'#define FALLBACK_LAYOUT_ID 0x{D.layout_id():08X}u',
             '',
             'struct LEDEntry {',
             '    uint8_t r, g, b;',
@@ -1479,22 +1267,20 @@ class App:
         root.title("Protogen Tool")
         root.configure(bg='#0d0d1a')
 
-        # ── Layout selector toolbar ──────────────────────────────────────────
+        # ── Display selector toolbar ─────────────────────────────────────────
         toolbar = tk.Frame(root, bg='#0d0d1a', pady=4)
         toolbar.pack(fill=tk.X, side=tk.TOP)
 
-        tk.Label(toolbar, text="Layout:", bg='#0d0d1a', fg='#aaa',
+        tk.Label(toolbar, text="Display:", bg='#0d0d1a', fg='#aaa',
                  font=('Helvetica', 9, 'bold')).pack(side=tk.LEFT, padx=(10, 4))
 
-        self._layout_var = tk.StringVar(value=str(_L['PANELS']))
-        for key, layout in sorted(LAYOUTS.items()):
-            tk.Radiobutton(
-                toolbar, text=layout['name'],
-                variable=self._layout_var, value=str(key),
-                bg='#0d0d1a', fg='white', selectcolor='#16213e',
-                activebackground='#0d0d1a', activeforeground='white',
-                command=self._on_layout_change,
-            ).pack(side=tk.LEFT, padx=6)
+        self._display_var = tk.StringVar(value=_D.name)
+        self._display_box = ttk.Combobox(toolbar, textvariable=self._display_var,
+                                         values=list(DISPLAYS), state='readonly', width=22)
+        self._display_box.pack(side=tk.LEFT, padx=4)
+        self._display_box.bind('<<ComboboxSelected>>', self._on_display_selected)
+        tk.Button(toolbar, text="Open display.json…", command=self._open_display,
+                  bg='#16213e', fg='white').pack(side=tk.LEFT, padx=4)
 
         self._layout_info = tk.Label(toolbar, text=self._layout_info_text(),
                                      bg='#0d0d1a', fg='#888', font=('Helvetica', 8),
@@ -1527,46 +1313,79 @@ class App:
         self._mic_refresh()
 
     def _layout_info_text(self):
-        L = _L
-        return (f"PANELS={L['PANELS']}  TOTAL_LEDS={L['TOTAL_LEDS']}  "
-                f"left_chain={L['LEDS_LEFT']}  right_chain={L['LEDS_RIGHT']}  "
-                f"(firmware: PROTOGEN_LAYOUT {L['PANELS']})")
+        D = _D
+        outs = ', '.join(f"{o['type']}" + (f" GP{o['pin']}" if 'pin' in o else '')
+                         for o in D.outputs)
+        return (f"{len(D.panels)} panels, {D.total_pixels} pixels  |  outputs: {outs}  "
+                f"|  must match the display the firmware is set up for")
 
-    def _on_layout_change(self):
-        new_panels = int(self._layout_var.get())
-        if new_panels == _L['PANELS']:
+    def _on_display_selected(self, _event=None):
+        cfg = DISPLAYS[self._display_var.get()]
+        if cfg is _D:
             return
         if not messagebox.askyesno(
-                "Switch layout?",
-                f"Switch to {new_panels}-panel layout?\n\n"
-                "Painter frames are converted panel-by-panel (eyes → eyes, "
-                "mouth → mouth, nose → nose); panels that don't exist in the "
-                "new layout are dropped.\nContinue?"):
-            # Revert radio button
-            self._layout_var.set(str(_L['PANELS']))
+                "Switch display?",
+                f"Switch to \"{cfg.name}\"?\n\n"
+                "Painter frames are converted panel by panel (eyes → eyes, "
+                "mouth → mouth, nose → nose); panels that don't exist on the "
+                "new display are dropped.\nContinue?"):
+            self._display_var.set(_D.name)
             return
-        self._apply_layout(new_panels)
+        self._apply_display(cfg)
 
-    def _apply_layout(self, new_panels):
-        old = _L
-        set_layout(new_panels)
-        self._layout_var.set(str(new_panels))
+    def _open_display(self):
+        path = filedialog.askopenfilename(
+            title="Open display config",
+            filetypes=[("Display config", "*.json"), ("All", "*.*")])
+        if not path:
+            return None
+        try:
+            cfg = dcfg.load(path)
+        except (dcfg.ConfigError, OSError) as e:
+            messagebox.showerror("Display config", f"Can't use {os.path.basename(path)}:\n\n{e}")
+            return None
+        DISPLAYS[cfg.name] = cfg
+        self._display_box.config(values=list(DISPLAYS))
+        if cfg is not _D:
+            self._apply_display(cfg)
+        return cfg
+
+    def _apply_display(self, cfg):
+        old = _D
+        set_display(cfg)
+        self._display_box.config(values=list(DISPLAYS))
+        self._display_var.set(cfg.name)
         self._layout_info.config(text=self._layout_info_text())
-        # Rebuild canvases and reset per-layout state
+        # Rebuild canvases and reset per-display state
         self.painter.rebuild_canvas(old)
         self.sim.rebuild_canvas()
         self.exporter.reset()
 
-    def ensure_layout(self, panels):
-        """Offer to switch to a file's layout.  Returns True if it now matches."""
-        if panels == _L['PANELS']:
+    def ensure_layout(self, anim):
+        """Make the active display match a loaded .anim.  Returns True if it now does."""
+        if anim.fits(_D):
+            return True
+        match = next((c for c in DISPLAYS.values() if anim.fits(c)), None)
+        if match is not None:
+            if not messagebox.askyesno(
+                    "Display mismatch",
+                    f"This file was made for \"{match.name}\" but the tool is set "
+                    f"to \"{_D.name}\".\n\nSwitch to \"{match.name}\"?"):
+                return False
+            self._apply_display(match)
             return True
         if not messagebox.askyesno(
-                "Layout mismatch",
-                f"This file uses the {panels}-panel layout but the tool is set "
-                f"to {_L['PANELS']}-panel.\n\nSwitch to the {panels}-panel layout?"):
+                "Display mismatch",
+                f"This file was made for {anim.describe()}, which doesn't match "
+                f"any display the tool has loaded.\n\nOpen its display.json?"):
             return False
-        self._apply_layout(panels)
+        cfg = self._open_display()
+        if cfg is None:
+            return False
+        if not anim.fits(cfg):
+            messagebox.showerror("Display mismatch",
+                                 f"\"{cfg.name}\" doesn't match this file either.")
+            return False
         return True
 
     def _mic_refresh(self):

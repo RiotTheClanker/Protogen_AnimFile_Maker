@@ -23,7 +23,9 @@ STARTS = ('top-left', 'top-right', 'bottom-left', 'bottom-right')
 FLIPS = ('none', 'h', 'v', 'hv')
 ROTATES = (0, 90, 180, 270)
 
-PRESET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'displays')
+# Presets ship in displays/ next to this file (or inside a PyInstaller bundle).
+PRESET_DIR = os.path.join(getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__))),
+                          'displays')
 
 
 class ConfigError(ValueError):
@@ -131,6 +133,62 @@ class DisplayConfig:
                     if j is not None:
                         out[a.offset + i] = b.offset + j
                         out[b.offset + j] = a.offset + i
+        return out
+
+
+# ── Drawing geometry ──────────────────────────────────────────────────────────
+def _bands(intervals, join_touching):
+    """Merge [start, end) intervals into sorted, non-overlapping bands."""
+    bands = []
+    for a, b in sorted(intervals):
+        if bands and (a < bands[-1][1] or (join_touching and a == bands[-1][1])):
+            bands[-1][1] = max(bands[-1][1], b)
+        else:
+            bands.append([a, b])
+    return bands
+
+
+class CanvasGeometry:
+    """
+    Where each panel is drawn on screen for an LED cell size.  Panel x/y come
+    from the config, in pixels; rows (and columns) of panels that do not
+    overlap get extra space between them for region outlines and labels.
+    """
+
+    def __init__(self, cfg, cell, gap, label_h):
+        self.cfg, self.cell = cfg, cell
+        # Side-by-side panels stay together; a row of panels directly under
+        # another gets room for the lower row's labels.
+        self._xb = _bands(((p.x, p.x + p.w) for p in cfg.panels), join_touching=True)
+        self._yb = _bands(((p.y, p.y + p.h) for p in cfg.panels), join_touching=False)
+        self._gap, self._label_h = gap, label_h
+        last_x, last_y = self._xb[-1][1], self._yb[-1][1]
+        self.width = self._sx(last_x, len(self._xb) - 1) + gap
+        self.height = self._sy(last_y, len(self._yb) - 1) + gap
+
+    def _sx(self, v, k):
+        return self._gap + v * self.cell + k * self._gap
+
+    def _sy(self, v, k):
+        return self._gap + self._label_h + v * self.cell + k * (self._gap + self._label_h)
+
+    @staticmethod
+    def _band(bands, v):
+        return next(i for i, (a, b) in enumerate(bands) if a <= v < b)
+
+    def origin(self, panel):
+        """Screen position of the panel's top-left pixel."""
+        return (self._sx(panel.x, self._band(self._xb, panel.x)),
+                self._sy(panel.y, self._band(self._yb, panel.y)))
+
+    def rects(self):
+        """{flat pixel index: (x1, y1, x2, y2)} for every pixel of the display."""
+        out, c = {}, self.cell
+        for p in self.cfg.panels:
+            ox, oy = self.origin(p)
+            for i, (x, y) in enumerate(p.pixels):
+                x1, y1 = ox + x * c, oy + y * c
+                out[p.offset + i] = (x1, y1, x1 + c - 1, y1 + c - 1)
         return out
 
 

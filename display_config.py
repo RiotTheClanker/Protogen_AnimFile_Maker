@@ -74,6 +74,7 @@ class DisplayConfig:
         self.total_pixels = offset
         self.by_id = {p.id: p for p in self.panels}
         self.mirror = data.get('mirror')
+        self.outlines = data.get('outlines', True)
         self.outputs = data['outputs']
         self.limits = data.get('limits', {})
 
@@ -113,14 +114,20 @@ class DisplayConfig:
         """
         {flat index: flat index on the other side} for "Mirror to other side",
         in both directions.
-        Panels are matched by region, then by order within the region; with
-        flip 'h' the order within a region is reversed and pixels are mirrored.
+        With match "region" (default) panels are matched by region, then by
+        order within the region; with match "order" the sides' panels are
+        simply paired in order.  With flip 'h' that order is reversed and
+        pixels are mirrored.
         """
         if not self.mirror:
             return {}
         flip = self.mirror.get('flip', 'none') if flip is None else flip
-        src = self.regions(self.mirror['from'])
-        dst = self.regions(self.mirror['to'])
+        if self.mirror.get('match', 'region') == 'order':
+            src = {None: [p for p in self.panels if p.side == self.mirror['from']]}
+            dst = {None: [p for p in self.panels if p.side == self.mirror['to']]}
+        else:
+            src = self.regions(self.mirror['from'])
+            dst = self.regions(self.mirror['to'])
         out = {}
         for region, sp in src.items():
             dp = dst.get(region, [])
@@ -279,9 +286,13 @@ def validate(data):
         _need(isinstance(m, dict) and isinstance(m.get('from'), str) and isinstance(m.get('to'), str),
               "\"mirror\" needs \"from\" and \"to\" side names")
         _need(m.get('flip', 'none') in ('none', 'h'), "mirror \"flip\" must be \"none\" or \"h\"")
+        _need(m.get('match', 'region') in ('region', 'order'),
+              "mirror \"match\" must be \"region\" or \"order\"")
         sides = {p.get('side') for p in panels}
         for k in ('from', 'to'):
             _need(m[k] in sides, f"mirror \"{k}\": no panel has side \"{m[k]}\"")
+
+    _need(isinstance(data.get('outlines', True), bool), "\"outlines\" must be true or false")
 
     outputs = data.get('outputs')
     _need(isinstance(outputs, list) and outputs, "\"outputs\" must be a non-empty list")

@@ -163,5 +163,38 @@ class ExampleTests(unittest.TestCase):
             dc.load(os.path.join(self.EXAMPLES, fn))
 
 
+class PlainPanelTests(unittest.TestCase):
+    """One big panel per side, no regions: mirror pairs panels by order."""
+    DATA = {
+        'protoface_display': 1, 'name': 'hub', 'outlines': False,
+        'panels': [{'id': 'Left', 'w': 64, 'h': 32, 'x': 0, 'y': 0, 'side': 'left'},
+                   {'id': 'Right', 'w': 64, 'h': 32, 'x': 68, 'y': 0, 'side': 'right'}],
+        'mirror': {'from': 'left', 'to': 'right', 'match': 'order', 'flip': 'h'},
+        'outputs': [{'type': 'hub75', 'width': 64, 'height': 32, 'chain': 2, 'pins': {},
+                     'place': [{'panel': 'Left', 'x': 0, 'y': 0},
+                               {'panel': 'Right', 'x': 64, 'y': 0}]}],
+    }
+
+    def test_mirror_by_order(self):
+        dc.validate(self.DATA)
+        cfg = dc.DisplayConfig(self.DATA)
+        self.assertFalse(cfg.outlines)
+        self.assertEqual(cfg.regions(), {})
+        m = cfg.mirror_map()
+        self.assertEqual(m[0], 2048 + 63)              # (0,0) -> (63,0) on the right panel
+        self.assertEqual(m[2048 + 63], 0)
+        self.assertEqual(cfg.mirror_map(flip='none')[5], 2048 + 5)
+
+    def test_bad_values(self):
+        d = copy.deepcopy(self.DATA)
+        d['outlines'] = 'no'
+        with self.assertRaises(dc.ConfigError):
+            dc.validate(d)
+        d = copy.deepcopy(self.DATA)
+        d['mirror']['match'] = 'id'
+        with self.assertRaises(dc.ConfigError):
+            dc.validate(d)
+
+
 if __name__ == '__main__':
     unittest.main()

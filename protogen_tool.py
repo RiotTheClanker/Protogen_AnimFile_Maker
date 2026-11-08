@@ -82,8 +82,10 @@ def region_groups(cfg):
     for p in cfg.panels:
         key = (p.side, p.region if p.region is not None else p.id)
         if key not in seen:
-            name = (p.region or p.id).upper()
-            label = f"{p.side.upper()} {name}" if p.side else name
+            if p.region is None:          # a plain panel: named by its id
+                label = p.id
+            else:
+                label = f"{p.side.upper()} {p.region.upper()}" if p.side else p.region.upper()
             seen[key] = len(groups)
             groups.append((label, p.side, p.region, []))
         groups[seen[key]][3].append(p)
@@ -105,7 +107,8 @@ def gap_for_cell(cell, max_gap):
     return min(max_gap, max(8, cell))
 
 def geometry(cell, max_gap):
-    return dcfg.CanvasGeometry(_D, cell, gap_for_cell(cell, max_gap), LABEL_H)
+    return dcfg.CanvasGeometry(_D, cell, gap_for_cell(cell, max_gap),
+                               LABEL_H if _D.outlines else 0)
 
 def fit_cell_to(width, height, max_gap):
     """Largest LED cell size whose layout fits in width × height pixels."""
@@ -117,6 +120,8 @@ def fit_cell_to(width, height, max_gap):
 
 def draw_region_outlines(canvas, led_rects):
     """Outline and label each region (eye, mouth, nose, …) on each side."""
+    if not _D.outlines:
+        return
     for i, (label, _side, region, panels) in enumerate(region_groups(_D)):
         rects = [led_rects[p.offset + k] for p in panels for k in range(p.count)
                  if p.offset + k in led_rects]
@@ -468,7 +473,7 @@ class PainterTab:
     def _build_fill_buttons(self):
         for w in self._ctrl_fill_frame.winfo_children():
             w.destroy()
-        regions = [(label.title(), panels) for label, _s, _r, panels in region_groups(_D)]
+        regions = [(label if r is None else label.title(), panels) for label, _s, r, panels in region_groups(_D)]
         regions.append(("All", list(_D.panels)))
         if _D.mirror:
             regions.append((f"Copy {_D.mirror['from']} → {_D.mirror['to']}", None))

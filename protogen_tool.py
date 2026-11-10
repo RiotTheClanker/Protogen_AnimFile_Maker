@@ -20,7 +20,7 @@ Requires: tkinter (stdlib), numpy, pyaudio (optional – for live mic)
   pip install numpy pyaudio
 """
 
-import copy, os, threading, time
+import copy, os, sys, threading, time
 import tkinter as tk
 from tkinter import filedialog, messagebox, colorchooser, ttk
 import numpy as np
@@ -28,6 +28,8 @@ import numpy as np
 import display_config as dcfg
 from anim_io import (read_anim, write_anim, remap_leds, blank_led, blank_leds,
                      SOUND_STATIC)
+import help_ui
+from help_ui import tip
 
 try:
     import pyaudio
@@ -96,6 +98,26 @@ EXTRA_COLORS  = ['#ffb74d', '#ce93d8', '#fff176', '#80cbc4', '#f48fb1']
 
 def region_color(region, i):
     return REGION_COLORS.get(region, EXTRA_COLORS[i % len(EXTRA_COLORS)])
+
+def describe_pixel(flat):
+    """'LEFT EYE · panel L_EYE · x 3, y 5' for the LED at flat index `flat`."""
+    for p in _D.panels:
+        if p.offset <= flat < p.offset + p.count:
+            x, y = p.pixels[flat - p.offset]
+            if p.region is None:          # a plain panel: its id is its name
+                return f"panel {p.id}  ·  x {x}, y {y}"
+            where = (f"{p.side.upper()} " if p.side else '') + p.region.upper()
+            return f"{where}  ·  panel {p.id}  ·  x {x}, y {y}"
+    return ''
+
+def frame_is_lit(leds):
+    return any(led[0] or led[1] or led[2] for led in leds)
+
+# Quick colour swatches in the Painter (keys 1-8)
+SWATCHES = [(255, 255, 255), (255, 0, 0), (255, 128, 0), (255, 255, 0),
+            (0, 255, 0), (0, 255, 255), (0, 64, 255), (255, 0, 255)]
+
+UNDO_LIMIT = 100
 
 # ── Shared canvas layout ──────────────────────────────────────────────────────
 LABEL_H  = 14        # space above each row of panels for region labels
@@ -324,6 +346,8 @@ class PainterTab:
         self.frames     = []
         self.frame_meta = []
         self.current    = 0
+        self._undo      = []      # see _push_undo_*()
+        self.dirty      = False   # unsaved changes since the last save / open
 
         self.draw_color  = (0, 255, 255)
         self.sound_mode  = tk.IntVar(value=SOUND_STATIC)
@@ -335,10 +359,13 @@ class PainterTab:
         self.eraser      = tk.BooleanVar(value=False)
         self.mirror      = tk.BooleanVar(value=True)
         self.flip        = tk.BooleanVar(value=self._default_flip())
+        self._erasing    = False  # right-button stroke in progress
 
         self._build_canvas()
         self._build_controls()
         self.new_frame()
+        self._undo.clear()
+        self.dirty = False
 
     # ── Canvas ────────────────────────────────────────────────────────────────
     # The canvas is packed by _build_controls(), after the controls column,
@@ -355,8 +382,15 @@ class PainterTab:
         self._build_mirror_maps()
         self._fit = FittedLedCanvas(self.frame, self.GAP, self._draw_all)
         self.canvas = self._fit.canvas
-        self.canvas.bind('<Button-1>', self._on_paint)
+        self.canvas.bind('<ButtonPress-1>', lambda e: self._start_stroke(e, False))
         self.canvas.bind('<B1-Motion>', self._on_paint)
+        # Right button erases (Button-2 is the right button on macOS)
+        for b in (2, 3):
+            self.canvas.bind(f'<ButtonPress-{b}>', lambda e: self._start_stroke(e, True))
+            self.canvas.bind(f'<B{b}-Motion>', self._on_paint)
+            self.canvas.bind(f'<ButtonRelease-{b}>', self._end_erase)
+        self.canvas.bind('<Motion>', self._on_hover)
+        self.canvas.bind('<Leave>', lambda e: self._status_clear())
         self._canvas_items = {}
         self._item_to_flat = {}
 
@@ -368,6 +402,7 @@ class PainterTab:
         self._flip_check.config(state=tk.NORMAL if _D.mirror else tk.DISABLED)
         # Carry existing artwork across, matching panels by side and region
         self.frames = [remap_leds(leds, old_cfg, _D) for leds in self.frames]
+        self._undo.clear()
         self._fit.relayout()
         self._fit._apply_size()
         if not self.frames:
@@ -377,98 +412,204 @@ class PainterTab:
         self._build_fill_buttons()
         self._draw_all()
 
+    # ── Status bar ────────────────────────────────────────────────────────────
+    @staticmethod
+    def _status_show(text):
+        if help_ui.Tooltip.status is not None:
+            help_ui.Tooltip.status.show(text)
+
+    @staticmethod
+    def _status_clear():
+        if help_ui.Tooltip.status is not None:
+            help_ui.Tooltip.status.clear()
+
     # ── Controls ─────────────────────────────────────────────────────────────
     def _build_controls(self):
         # Scrolls when the window is too short to show every control
-        scroll = ScrollFrame(self.frame, bg='#1a1a2e', width=230)
+        scroll = ScrollFrame(self.frame, bg='#1a1a2e', width=240)
         scroll.pack(side=tk.RIGHT, fill=tk.Y, padx=8, pady=8)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
         ctrl = scroll.inner
         self._ctrl = scroll
+        BG = '#1a1a2e'
 
-        def section(t):
-            tk.Label(ctrl, text=t, bg='#1a1a2e', fg='#e94560',
+        def section(t, note=None):
+            tk.Label(ctrl, text=t, bg=BG, fg='#e94560',
                      font=('Helvetica', 9, 'bold')).pack(anchor='w', pady=(10, 0))
+            if note:
+                tk.Label(ctrl, text=note, bg=BG, fg='#777', font=('Helvetica', 8),
+                         wraplength=220, justify=tk.LEFT).pack(anchor='w')
+
+        def label(t):
+            w = tk.Label(ctrl, text=t, bg=BG, fg='#888')
+            w.pack(anchor='w')
+            return w
+
+        def slider(var, lo, hi, res=1, command=None):
+            w = tk.Scale(ctrl, from_=lo, to=hi, resolution=res, orient=tk.HORIZONTAL,
+                         variable=var, bg=BG, fg='white', troughcolor='#16213e',
+                         highlightthickness=0, command=command)
+            w.pack(fill=tk.X)
+            return w
+
+        def check(t, var, text_tip, **kw):
+            w = tk.Checkbutton(ctrl, text=t, variable=var, bg=BG, fg='white',
+                               selectcolor='#16213e', **kw)
+            w.pack(anchor='w')
+            return tip(w, text_tip)
 
         # Brush
-        section("BRUSH")
-        tk.Button(ctrl, text="Pick Color", command=self._pick_color,
-                  bg='#16213e', fg='white').pack(fill=tk.X, pady=2)
-        self.color_preview = tk.Label(ctrl, bg=hex_color(self.draw_color), height=2)
+        section("BRUSH", "Used for the LEDs you paint next.")
+        sw = tk.Frame(ctrl, bg=BG)
+        sw.pack(fill=tk.X, pady=(4, 2))
+        for i, rgb in enumerate(SWATCHES):
+            s = tk.Label(sw, bg=hex_color(rgb), width=2, height=1, relief=tk.RAISED,
+                         borderwidth=1, cursor='hand2')
+            s.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
+            s.bind('<Button-1>', lambda e, c=rgb: self.set_color(c))
+            tip(s, f"Paint with this colour  (key {i + 1})")
+        tip(tk.Button(ctrl, text="Pick Color…", command=self._pick_color,
+                      bg='#16213e', fg='white'),
+            "Choose any colour for the brush  (C)").pack(fill=tk.X, pady=2)
+        self.color_preview = tk.Label(ctrl, bg=hex_color(self.draw_color), height=2,
+                                      text="brush", fg='#000')
         self.color_preview.pack(fill=tk.X, pady=2)
-        tk.Checkbutton(ctrl, text="Eraser", variable=self.eraser,
-                       bg='#1a1a2e', fg='white', selectcolor='#16213e').pack(anchor='w')
+        tip(self.color_preview, "The colour you're painting with")
+        check("Eraser", self.eraser,
+              "Paint LEDs black (off).  Right-click on the face erases too.  (E)",
+              command=self._update_brush_preview)
         state = tk.NORMAL if _D.mirror else tk.DISABLED
-        self._mirror_check = tk.Checkbutton(
-            ctrl, text="Mirror to other side", variable=self.mirror, state=state,
-            bg='#1a1a2e', fg='white', selectcolor='#16213e')
-        self._mirror_check.pack(anchor='w')
-        self._flip_check = tk.Checkbutton(
-            ctrl, text="  Flip left↔right when mirroring", variable=self.flip, state=state,
-            bg='#1a1a2e', fg='white', selectcolor='#16213e')
-        self._flip_check.pack(anchor='w')
+        self._mirror_check = check(
+            "Mirror to other side", self.mirror,
+            "Also paint the matching LED on the other side of the face, so you "
+            "only draw one half.  (M)", state=state)
+        self._flip_check = check(
+            "  Flip left↔right when mirroring", self.flip,
+            "Make the other side a mirror image, like a real face.  Leave it on "
+            "for Mk2 and Mk3.  If the right side is backwards on the helmet, "
+            "turn it off.", state=state)
 
         # Sound
-        section("SOUND REACTION")
-        for lbl, val in [("Static", SOUND_STATIC), ("Snap", SOUND_SNAP),
-                          ("Linear y=mx+b", SOUND_LINEAR)]:
-            tk.Radiobutton(ctrl, text=lbl, variable=self.sound_mode, value=val,
-                           bg='#1a1a2e', fg='white', selectcolor='#16213e').pack(anchor='w')
+        section("SOUND REACTION", "How the LEDs you paint next react to the mic.")
+        for lbl, val, text_tip in [
+                ("Static (always on)", SOUND_STATIC,
+                 "The LED always shows its colour. Use this for most of the face."),
+                ("Snap (on when loud)", SOUND_SNAP,
+                 "The LED is off when quiet and turns on when the volume reaches "
+                 "the threshold below. Good for a talking mouth."),
+                ("Linear (brighter when louder)", SOUND_LINEAR,
+                 "The LED fades in as the volume goes up, set by m and b below.")]:
+            tip(tk.Radiobutton(ctrl, text=lbl, variable=self.sound_mode, value=val,
+                               bg=BG, fg='white', selectcolor='#16213e',
+                               command=self._update_sound_controls),
+                text_tip).pack(anchor='w')
 
-        tk.Label(ctrl, text="Snap threshold (0-255):", bg='#1a1a2e', fg='#888').pack(anchor='w')
-        tk.Scale(ctrl, from_=0, to=255, orient=tk.HORIZONTAL, variable=self.snap_thresh,
-                 bg='#1a1a2e', fg='white', troughcolor='#16213e',
-                 highlightthickness=0).pack(fill=tk.X)
-
-        tk.Label(ctrl, text="Linear m (slope, 0-15):", bg='#1a1a2e', fg='#888').pack(anchor='w')
-        tk.Scale(ctrl, from_=0, to=15, resolution=1, orient=tk.HORIZONTAL,
-                 variable=self.linear_m, bg='#1a1a2e', fg='white',
-                 troughcolor='#16213e', highlightthickness=0).pack(fill=tk.X)
-
-        tk.Label(ctrl, text="Linear b (offset, 0-15):", bg='#1a1a2e', fg='#888').pack(anchor='w')
-        tk.Scale(ctrl, from_=0, to=15, resolution=1, orient=tk.HORIZONTAL,
-                 variable=self.linear_b, bg='#1a1a2e', fg='white',
-                 troughcolor='#16213e', highlightthickness=0).pack(fill=tk.X)
+        snap_l = label("Snap: on at volume (0-255):")
+        snap_s = tip(slider(self.snap_thresh, 0, 255),
+                     "Low (60) reacts to quiet sounds, high (200) needs shouting.")
+        m_l = label("Linear m, how fast (0-15):")
+        m_s = tip(slider(self.linear_m, 0, 15),
+                  "1 fades in slowly over the whole volume range; 12 is fully "
+                  "bright as soon as there's some sound.")
+        b_l = label("Linear b, when silent (0-15):")
+        b_s = tip(slider(self.linear_b, 0, 15),
+                  "0 = off when silent, 15 = full brightness even when silent.")
+        self._snap_widgets   = [snap_l, snap_s]
+        self._linear_widgets = [m_l, m_s, b_l, b_s]
 
         # Timing
-        section("FRAME TIMING")
-        for lbl, val in [("Timed", TIMING_TIMED), ("Sound triggered", TIMING_SOUND)]:
-            tk.Radiobutton(ctrl, text=lbl, variable=self.timing_mode, value=val,
-                           bg='#1a1a2e', fg='white', selectcolor='#16213e').pack(anchor='w')
-        tk.Label(ctrl, text="Duration ms (min hold if sound):",
-                 bg='#1a1a2e', fg='#888').pack(anchor='w')
-        tk.Scale(ctrl, from_=0, to=5000, resolution=50, orient=tk.HORIZONTAL,
-                 variable=self.duration_ms, bg='#1a1a2e', fg='white',
-                 troughcolor='#16213e', highlightthickness=0).pack(fill=tk.X)
+        section("FRAME TIMING", "Settings for the frame you're on. Every frame has its own.")
+        for lbl, val, text_tip in [
+                ("Timed (show for a set time)", TIMING_TIMED,
+                 "Show this frame for the time below, then go to the next one."),
+                ("Sound triggered (wait for sound)", TIMING_SOUND,
+                 f"Stay on this frame until the volume goes past {SOUND_TRIGGER_LEVEL}, "
+                 "then go to the next one.")]:
+            tip(tk.Radiobutton(ctrl, text=lbl, variable=self.timing_mode, value=val,
+                               bg=BG, fg='white', selectcolor='#16213e',
+                               command=self._update_timing_controls),
+                text_tip).pack(anchor='w')
+        self._duration_label = label("")
+        tip(slider(self.duration_ms, 0, 5000, 50, command=self._update_timing_controls),
+            "1000 ms = 1 second.  A blink is about 100-150 ms per frame.")
 
         # Frames
         section("FRAMES")
-        row = tk.Frame(ctrl, bg='#1a1a2e')
-        row.pack(fill=tk.X)
-        for lbl, cmd in [("+ New", self.new_frame), ("◀", self.prev_frame),
-                          ("▶", self.next_frame),   ("Copy", self.copy_frame),
-                          ("✕", self.delete_frame)]:
-            tk.Button(row, text=lbl, command=cmd,
-                      bg='#3d0000' if lbl == '✕' else '#16213e',
-                      fg='white', padx=2).pack(side=tk.LEFT, expand=True, fill=tk.X)
+        nav = tk.Frame(ctrl, bg=BG)
+        nav.pack(fill=tk.X)
+        tip(tk.Button(nav, text="◀ Prev", command=self.prev_frame, bg='#16213e',
+                      fg='white', padx=2), "Previous frame  (←)").pack(side=tk.LEFT)
+        tip(tk.Button(nav, text="Next ▶", command=self.next_frame, bg='#16213e',
+                      fg='white', padx=2), "Next frame  (→)").pack(side=tk.RIGHT)
+        self.frame_label = tk.Label(nav, text="Frame 1/1", bg=BG, fg='white')
+        self.frame_label.pack(side=tk.LEFT, expand=True)
 
-        self.frame_label = tk.Label(ctrl, text="Frame 1/1", bg='#1a1a2e', fg='white')
-        self.frame_label.pack()
+        row = tk.Frame(ctrl, bg=BG)
+        row.pack(fill=tk.X, pady=(2, 0))
+        for lbl, cmd, text_tip, bg in [
+                ("+ New", self.new_frame,
+                 "Add a blank frame at the end  (Ctrl+N)", '#16213e'),
+                ("Duplicate", self.copy_frame,
+                 "Copy this frame to the end, then change it a little. "
+                 "The easiest way to animate.  (Ctrl+D)", '#16213e'),
+                ("Delete", self.delete_frame, "Delete this frame", '#3d0000')]:
+            tip(tk.Button(row, text=lbl, command=cmd, bg=bg, fg='white', padx=2),
+                text_tip).pack(side=tk.LEFT, expand=True, fill=tk.X)
+        tip(tk.Button(ctrl, text="↶ Undo", command=self.undo, bg='#16213e', fg='white'),
+            "Undo the last stroke, fill, clear or frame change  (Ctrl+Z)"
+            ).pack(fill=tk.X, pady=(4, 0))
 
         # Fill — built dynamically to match current layout
-        section("FILL REGION")
-        self._ctrl_fill_frame = tk.Frame(ctrl, bg='#1a1a2e')
+        section("FILL REGION", "Fill a whole region with the brush.")
+        self._ctrl_fill_frame = tk.Frame(ctrl, bg=BG)
         self._ctrl_fill_frame.pack(fill=tk.X)
         self._build_fill_buttons()
 
         # File
-        section("FILE")
-        tk.Button(ctrl, text="Open .anim", command=self._open_anim,
-                  bg='#0f3460', fg='white').pack(fill=tk.X, pady=2)
-        tk.Button(ctrl, text="Save .anim", command=self.save_anim,
-                  bg='#0f3460', fg='white').pack(fill=tk.X, pady=2)
-        tk.Button(ctrl, text="Clear Frame", command=self.clear_frame,
-                  bg='#3d0000', fg='white').pack(fill=tk.X, pady=2)
+        section("FILE", "Save a .anim and copy it to the helmet's SD card. "
+                        "Name it start.anim to play it at power-on.")
+        tip(tk.Button(ctrl, text="Open .anim", command=self._open_anim,
+                      bg='#0f3460', fg='white'),
+            "Open a saved animation to edit it  (Ctrl+O)").pack(fill=tk.X, pady=2)
+        tip(tk.Button(ctrl, text="Save .anim", command=self.save_anim,
+                      bg='#0f3460', fg='white'),
+            "Save all frames as a .anim file for the SD card  (Ctrl+S)").pack(fill=tk.X, pady=2)
+        tip(tk.Button(ctrl, text="Clear Frame", command=self.clear_frame,
+                      bg='#3d0000', fg='white'),
+            "Turn every LED in this frame off").pack(fill=tk.X, pady=2)
+
+        self._update_sound_controls()
+        self._update_timing_controls()
+
+    def _update_sound_controls(self):
+        """Grey out the sliders the chosen sound reaction doesn't use."""
+        sm = self.sound_mode.get()
+        for widgets, on in ((self._snap_widgets, sm == SOUND_SNAP),
+                            (self._linear_widgets, sm == SOUND_LINEAR)):
+            for w in widgets:
+                w.config(state=tk.NORMAL if on else tk.DISABLED,
+                         fg='white' if on and isinstance(w, tk.Scale) else
+                            ('#888' if on else '#444'))
+        self._update_brush_preview()
+
+    def _update_timing_controls(self, _=None):
+        ms = self.duration_ms.get()
+        if self.timing_mode.get() == TIMING_TIMED:
+            text = f"Show this frame for {ms} ms ({ms / 1000:g} s):"
+        else:
+            text = f"Stay at least {ms} ms, then wait for sound:"
+        self._duration_label.config(text=text)
+
+    def _update_brush_preview(self):
+        if self.eraser.get():
+            self.color_preview.config(bg='#000000', fg='#888', text="eraser")
+            return
+        r, g, b = self.draw_color
+        fg = '#000' if (r * 299 + g * 587 + b * 114) > 128000 else '#fff'
+        mode = {SOUND_STATIC: "always on", SOUND_SNAP: "on when loud",
+                SOUND_LINEAR: "brighter when louder"}[self.sound_mode.get()]
+        self.color_preview.config(bg=hex_color(self.draw_color), fg=fg,
+                                  text=f"brush  ·  {mode}")
 
     def _build_fill_buttons(self):
         for w in self._ctrl_fill_frame.winfo_children():
@@ -480,8 +621,12 @@ class PainterTab:
         for lbl, panels in regions:
             cmd = (self._copy_side_to_other if panels is None
                    else (lambda p=panels: self._fill_panels(p)))
-            tk.Button(self._ctrl_fill_frame, text=lbl, command=cmd,
-                      bg='#16213e', fg='white').pack(fill=tk.X, pady=1)
+            text_tip = (f"Copy the whole {_D.mirror['from']} side onto the "
+                        f"{_D.mirror['to']} side" if panels is None else
+                        "Fill every LED on the display with the brush" if lbl == "All"
+                        else f"Fill the {lbl.lower()} with the brush")
+            tip(tk.Button(self._ctrl_fill_frame, text=lbl, command=cmd,
+                          bg='#16213e', fg='white'), text_tip).pack(fill=tk.X, pady=1)
 
     # ── Drawing ───────────────────────────────────────────────────────────────
     def _draw_all(self):
@@ -507,9 +652,49 @@ class PainterTab:
         r, g, b = self.frames[self.current][flat][:3]
         self.canvas.itemconfig(self._canvas_items[flat], fill=hex_color((r, g, b)))
 
+    # ── Undo ──────────────────────────────────────────────────────────────────
+    # Two kinds of entry:
+    #   ('leds', frame, copy)                 a frame's pixels before a change;
+    #                                          restored in place, so the frame
+    #                                          object stays the same one
+    #   ('frames', frames, meta, current)     the frame list before new /
+    #                                          duplicate / delete
+    def _push(self, entry):
+        self._undo.append(entry)
+        del self._undo[:-UNDO_LIMIT]
+        self.dirty = True
+
+    def _push_undo_leds(self):
+        leds = self.frames[self.current]
+        self._push(('leds', leds, [list(led) for led in leds]))
+
+    def _push_undo_frames(self):
+        self._save_meta()
+        self._push(('frames', list(self.frames),
+                    [dict(m) for m in self.frame_meta], self.current))
+
+    def undo(self):
+        if not self._undo:
+            self._status_show("Nothing to undo.")
+            return
+        self._save_meta()
+        entry = self._undo.pop()
+        if entry[0] == 'leds':
+            _kind, leds, saved = entry
+            leds[:] = saved
+            idx = next((i for i, f in enumerate(self.frames) if f is leds), None)
+            if idx is not None:
+                self.current = idx
+        else:
+            _kind, frames, meta, current = entry
+            self.frames, self.frame_meta = frames, meta
+            self.current = min(current, len(frames) - 1)
+        self._load_meta()
+        self._draw_all()
+
     # ── Input ─────────────────────────────────────────────────────────────────
     def _current_brush(self):
-        if self.eraser.get():
+        if self.eraser.get() or self._erasing:
             return blank_led()
         sm = self.sound_mode.get()
         param = (self.snap_thresh.get() if sm == SOUND_SNAP else
@@ -526,13 +711,36 @@ class PainterTab:
         """
         return self._mirror_maps[self.flip.get()].get(flat)
 
-    def _on_paint(self, event):
-        flat = next((self._item_to_flat[i]
+    def _flat_at(self, event):
+        return next((self._item_to_flat[i]
                      for i in self.canvas.find_overlapping(event.x, event.y,
                                                            event.x, event.y)
                      if i in self._item_to_flat), None)
+
+    def _start_stroke(self, event, erase):
+        self.canvas.focus_set()          # so the keyboard shortcuts work
+        self._erasing = erase
+        self._stroke_saved = False       # undo point is made on the first paint
+        self._on_paint(event)
+
+    def _end_erase(self, _event=None):
+        self._erasing = False
+
+    def _on_hover(self, event):
+        flat = self._flat_at(event)
+        if flat is None:
+            self._status_clear()
+        else:
+            self._status_show(describe_pixel(flat))
+
+    def _on_paint(self, event):
+        flat = self._flat_at(event)
         if flat is None:
             return
+        self._status_show(describe_pixel(flat))
+        if not getattr(self, '_stroke_saved', True):
+            self._push_undo_leds()
+            self._stroke_saved = True
         leds  = self.frames[self.current]
         brush = self._current_brush()
         targets = [flat]
@@ -547,19 +755,21 @@ class PainterTab:
     # ── Frame ops ─────────────────────────────────────────────────────────────
     def _save_meta(self):
         if self.frame_meta:
-            self.frame_meta[self.current] = {
-                'duration_ms': self.duration_ms.get(),
-                'timing_mode': self.timing_mode.get(),
-            }
+            new = {'duration_ms': self.duration_ms.get(),
+                   'timing_mode': self.timing_mode.get()}
+            if self.frame_meta[self.current] != new:
+                self.frame_meta[self.current] = new
+                self.dirty = True
 
     def _load_meta(self):
         m = self.frame_meta[self.current]
         self.duration_ms.set(m.get('duration_ms', 500))
         self.timing_mode.set(m.get('timing_mode', TIMING_TIMED))
+        self._update_timing_controls()
 
     def new_frame(self):
         if self.frames:
-            self._save_meta()
+            self._push_undo_frames()
         self.frames.append(blank_led_list())
         self.frame_meta.append({'duration_ms': 500, 'timing_mode': TIMING_TIMED})
         self.current = len(self.frames) - 1
@@ -567,7 +777,7 @@ class PainterTab:
         self._draw_all()
 
     def copy_frame(self):
-        self._save_meta()
+        self._push_undo_frames()
         self.frames.append(copy.deepcopy(self.frames[self.current]))
         self.frame_meta.append(dict(self.frame_meta[self.current]))
         self.current = len(self.frames) - 1
@@ -576,13 +786,16 @@ class PainterTab:
 
     def delete_frame(self):
         if len(self.frames) <= 1:
-            messagebox.showinfo("Info", "Can't delete the only frame.")
+            messagebox.showinfo("Info", "Can't delete the only frame. "
+                                "Use Clear Frame to turn its LEDs off.")
             return
+        self._push_undo_frames()
         del self.frames[self.current]
         del self.frame_meta[self.current]
         self.current = max(0, self.current - 1)
         self._load_meta()
         self._draw_all()
+        self._status_show("Frame deleted.  Ctrl+Z brings it back.")
 
     def prev_frame(self):
         if self.current > 0:
@@ -599,10 +812,13 @@ class PainterTab:
             self._draw_all()
 
     def clear_frame(self):
-        self.frames[self.current] = blank_led_list()
+        self._push_undo_leds()
+        self.frames[self.current][:] = blank_led_list()
         self._draw_all()
+        self._status_show("Frame cleared.  Ctrl+Z brings it back.")
 
     def _fill_panels(self, panels):
+        self._push_undo_leds()
         brush = self._current_brush()
         leds  = self.frames[self.current]
         for p in panels:
@@ -611,6 +827,7 @@ class PainterTab:
         self._draw_all()
 
     def _copy_side_to_other(self):
+        self._push_undo_leds()
         leds = self.frames[self.current]
         for p in _D.panels:
             if p.side != _D.mirror['from']:
@@ -622,15 +839,40 @@ class PainterTab:
         self._draw_all()
 
     # ── Color ─────────────────────────────────────────────────────────────────
+    def set_color(self, rgb):
+        self.draw_color = tuple(rgb)
+        self.eraser.set(False)          # picking a colour means "paint now"
+        self._update_brush_preview()
+
+    def pick_swatch(self, i):
+        if 0 <= i < len(SWATCHES):
+            self.set_color(SWATCHES[i])
+
     def _pick_color(self):
         result = colorchooser.askcolor(color=hex_color(self.draw_color),
                                        title="Pick brush color")
         if result and result[0]:
-            self.draw_color = tuple(int(v) for v in result[0])
-            self.color_preview.config(bg=hex_color(self.draw_color))
+            self.set_color(int(v) for v in result[0])
 
     # ── File I/O ──────────────────────────────────────────────────────────────
+    def confirm_discard(self, action):
+        """Ask before `action` throws away unsaved work.  True = go ahead."""
+        self._save_meta()
+        if not self.dirty:
+            return True
+        answer = messagebox.askyesnocancel(
+            "Unsaved changes",
+            f"Your animation has changes that aren't saved.\n\n"
+            f"Save them before {action}?")
+        if answer is None:
+            return False
+        if answer:
+            return self.save_anim()
+        return True
+
     def _open_anim(self):
+        if not self.confirm_discard("opening another file"):
+            return
         path = filedialog.askopenfilename(
             filetypes=[("Anim files", "*.anim"), ("All", "*.*")])
         if not path:
@@ -647,25 +889,34 @@ class PainterTab:
             self.frame_meta = [{'duration_ms': fr['duration_ms'],
                                  'timing_mode': fr['timing_mode']} for fr in loaded]
             self.current = 0
+            self._undo.clear()
             self._load_meta()
             self._draw_all()
+            self.dirty = False
             messagebox.showinfo("Opened", f"Loaded {len(self.frames)} frames from\n{path}")
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
     def save_anim(self):
+        """Save to a file the user picks.  Returns True if it was saved."""
         self._save_meta()
         path = filedialog.asksaveasfilename(
             defaultextension=".anim",
             filetypes=[("Anim files", "*.anim"), ("All", "*.*")])
         if not path:
-            return
+            return False
         try:
             write_anim(path, _D, self.get_frames_data())
         except Exception as e:
             messagebox.showerror("Error", f"Could not save:\n{e}")
-            return
-        messagebox.showinfo("Saved", f"{len(self.frames)} frames for \"{_D.name}\" → {path}")
+            return False
+        self.dirty = False
+        messagebox.showinfo(
+            "Saved",
+            f"{len(self.frames)} frames for \"{_D.name}\" → {path}\n\n"
+            "Copy the file to the root of the helmet's SD card. Name it "
+            "start.anim to play it when the helmet turns on.")
+        return True
 
     def get_frames_data(self):
         """Return frames in the same dict format used by read_anim."""
@@ -700,6 +951,7 @@ class SimulatorTab:
         self._play_after = None
         self._frame_start = 0.0
         self._trigger_armed = True
+        self.source = None        # None, 'painter' or 'file'
 
         self._build_canvas()
         self._build_controls()
@@ -720,6 +972,7 @@ class SimulatorTab:
         """Call after layout change."""
         self._stop_play()
         self.frames = []
+        self.source = None
         self._fit.relayout()
         self._draw_blank()
         self._fit._apply_size()
@@ -741,10 +994,12 @@ class SimulatorTab:
 
         # File
         section("FILE")
-        tk.Button(ctrl, text="Open .anim", command=self._open_file,
-                  bg='#0f3460', fg='white').pack(fill=tk.X, pady=2)
-        tk.Button(ctrl, text="Preview Painter Frames", command=self._load_from_painter,
-                  bg='#0f3460', fg='white').pack(fill=tk.X, pady=2)
+        tip(tk.Button(ctrl, text="Preview Painter Frames", command=self.load_from_painter,
+                      bg='#0f3460', fg='white'),
+            "Play what you've painted, without saving first  (P)").pack(fill=tk.X, pady=2)
+        tip(tk.Button(ctrl, text="Open .anim", command=self._open_file,
+                      bg='#0f3460', fg='white'),
+            "Play a saved .anim file").pack(fill=tk.X, pady=2)
         self.file_label = tk.Label(ctrl, text="No file loaded", bg='#0d0d1a',
                                    fg='#888', wraplength=200)
         self.file_label.pack(anchor='w')
@@ -759,22 +1014,26 @@ class SimulatorTab:
 
         nav = tk.Frame(ctrl, bg='#0d0d1a')
         nav.pack(fill=tk.X, pady=4)
-        tk.Button(nav, text="◀ Prev", command=self.prev_frame,
-                  bg='#16213e', fg='white').pack(side=tk.LEFT, expand=True, fill=tk.X)
-        tk.Button(nav, text="Next ▶", command=self.next_frame,
-                  bg='#16213e', fg='white').pack(side=tk.LEFT, expand=True, fill=tk.X)
+        tip(tk.Button(nav, text="◀ Prev", command=self.prev_frame,
+                      bg='#16213e', fg='white'),
+            "Step back one frame  (←)").pack(side=tk.LEFT, expand=True, fill=tk.X)
+        tip(tk.Button(nav, text="Next ▶", command=self.next_frame,
+                      bg='#16213e', fg='white'),
+            "Step forward one frame  (→)").pack(side=tk.LEFT, expand=True, fill=tk.X)
 
-        self.play_btn = tk.Button(ctrl, text="▶ Auto Play", command=self._toggle_play,
-                                  bg='#1a472a', fg='white')
+        self.play_btn = tip(tk.Button(ctrl, text="▶ Auto Play", command=self.toggle_play,
+                                      bg='#1a472a', fg='white'),
+                            "Play with the same timing and sound rules as the helmet  (Space)")
         self.play_btn.pack(fill=tk.X, pady=2)
 
         # Audio
         section("AUDIO INPUT")
         mic_row = tk.Frame(ctrl, bg='#0d0d1a')
         mic_row.pack(fill=tk.X)
-        self.mic_btn = tk.Button(mic_row, text="🎤 Use Mic",
-                                 command=self._toggle_mic,
-                                 bg='#16213e', fg='white')
+        self.mic_btn = tip(tk.Button(mic_row, text="🎤 Use Mic",
+                                     command=self._toggle_mic,
+                                     bg='#16213e', fg='white'),
+                           "Use your computer's microphone as the helmet's mic")
         self.mic_btn.pack(side=tk.LEFT, expand=True, fill=tk.X)
         if not PYAUDIO_OK:
             tk.Label(mic_row, text="(pyaudio not installed)",
@@ -782,10 +1041,12 @@ class SimulatorTab:
 
         tk.Label(ctrl, text="Manual volume (0-255):",
                  bg='#0d0d1a', fg='#888').pack(anchor='w', pady=(6, 0))
-        self.vol_slider = tk.Scale(ctrl, from_=0, to=255, orient=tk.HORIZONTAL,
+        self.vol_slider = tip(tk.Scale(ctrl, from_=0, to=255, orient=tk.HORIZONTAL,
                                    variable=self.vol_override, command=self._on_slider,
                                    bg='#0d0d1a', fg='white', troughcolor='#16213e',
-                                   highlightthickness=0)
+                                   highlightthickness=0),
+                              "Pretend there's sound: drag right to see Snap and Linear "
+                              "LEDs react and sound-triggered frames advance")
         self.vol_slider.pack(fill=tk.X)
 
         self.vu_canvas = tk.Canvas(ctrl, height=16, bg='#0d0d1a', highlightthickness=0)
@@ -802,10 +1063,11 @@ class SimulatorTab:
             tk.Label(row, text=label, bg='#0d0d1a', fg='white').pack(side=tk.LEFT)
 
         tk.Label(ctrl,
-                 text="SNAP   = flashes on threshold\n"
-                      "LINEAR = y=mx+b brightness\n"
-                      f"SOUND frames advance when volume\n"
-                      f"rises past {SOUND_TRIGGER_LEVEL}",
+                 text="Snap LEDs turn on when the volume\n"
+                      "reaches their threshold.\n"
+                      "Linear LEDs get brighter as it rises.\n"
+                      "Sound-triggered frames advance\n"
+                      f"when the volume rises past {SOUND_TRIGGER_LEVEL}.",
                  bg='#0d0d1a', fg='#666', font=('Helvetica', 8),
                  justify=tk.LEFT).pack(anchor='w', pady=8)
 
@@ -824,17 +1086,32 @@ class SimulatorTab:
             if not self._ensure_layout(anim):
                 return
             self._load_frames(frames)
+            self.source = 'file'
             self.file_label.config(text=os.path.basename(path))
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
-    def _load_from_painter(self):
+    def load_from_painter(self):
         frames = self._get_painter_frames()
         if not frames:
             messagebox.showinfo("Info", "No frames in Painter yet.")
             return
         self._load_frames(frames)
+        self.source = 'painter'
         self.file_label.config(text="[Painter frames]")
+
+    def on_shown(self):
+        """The tab was opened: show the Painter's latest frames, unless a file
+        is loaded or something is playing."""
+        if self.source != 'file' and not self.playing:
+            frames = self._get_painter_frames()
+            if frames:
+                current = self.current
+                self._load_frames(frames)
+                self.current = min(current, len(frames) - 1)
+                self.source = 'painter'
+                self.file_label.config(text="[Painter frames]")
+                self._render_frame()
 
     def _load_frames(self, frames):
         self._stop_play()
@@ -852,10 +1129,24 @@ class SimulatorTab:
                                                 width=self._fit.outline_width)
             self._canvas_items[flat] = item
         draw_region_outlines(self.canvas, self._fit.rects)
+        if not self.frames:
+            w = max(self.canvas.winfo_width(), 200)
+            h = max(self.canvas.winfo_height(), 100)
+            self.canvas.create_text(
+                w // 2, h // 2, fill='#9a9ab0', font=('Helvetica', 13), justify=tk.CENTER,
+                width=max(200, w - 40),
+                text="Nothing to play yet.\n\nClick \"Preview Painter Frames\" to play "
+                     "what you've painted,\nor \"Open .anim\" to play a saved file.",
+                tags='empty_hint')
+            x1, y1, x2, y2 = self.canvas.bbox('empty_hint')
+            self.canvas.tag_lower(self.canvas.create_rectangle(
+                x1 - 16, y1 - 12, x2 + 16, y2 + 12, fill='#0d0d1a', outline='#2a2a4a',
+                tags='empty_hint'), 'empty_hint')
 
     def _render_frame(self):
         if not self.frames:
             return
+        self.canvas.delete('empty_hint')
         frame = self.frames[self.current]
         vol   = self._get_volume()
 
@@ -906,7 +1197,7 @@ class SimulatorTab:
                 messagebox.showerror("Error", "Could not open microphone.")
 
     # ── Playback ──────────────────────────────────────────────────────────────
-    def _toggle_play(self):
+    def toggle_play(self):
         if self.playing:
             self._stop_play()
         else:
@@ -1001,6 +1292,14 @@ class ExportTab:
         def section(t):
             tk.Label(f, text=t, bg=BG, fg=ACC,
                      font=('Helvetica', 10, 'bold')).pack(anchor='w', padx=12, pady=(14, 2))
+
+        tk.Label(f, text="Most people don't need this tab. To put an animation on the "
+                         "helmet, save a .anim in the Painter and copy it to the SD card.\n"
+                         "This tab is for building the firmware yourself: it turns one frame "
+                         "into fallback_anim.h, the face built into the firmware and shown "
+                         "when there's no SD card or no start.anim.",
+                 bg=BG, fg='#9a9ab0', justify=tk.LEFT, wraplength=640,
+                 font=('Helvetica', 9)).pack(anchor='w', padx=12, pady=(12, 0))
 
         # Source
         section("SOURCE")
@@ -1284,8 +1583,16 @@ class App:
                                          values=list(DISPLAYS), state='readonly', width=22)
         self._display_box.pack(side=tk.LEFT, padx=4)
         self._display_box.bind('<<ComboboxSelected>>', self._on_display_selected)
-        tk.Button(toolbar, text="Open display.json…", command=self._open_display,
-                  bg='#16213e', fg='white').pack(side=tk.LEFT, padx=4)
+        tip(self._display_box, "The LED layout of your helmet. It must match the display "
+                               "the firmware is set up for. Pick it before you start.")
+        tip(tk.Button(toolbar, text="Open display.json…", command=self._open_display,
+                      bg='#16213e', fg='white'),
+            "Load a display that isn't in the list (HUB75, MAX7219, your own LED board) "
+            "from its display.json").pack(side=tk.LEFT, padx=4)
+        tip(tk.Button(toolbar, text="? Help", command=lambda: self.help.toggle(),
+                      bg='#e94560', fg='white', font=('Helvetica', 9, 'bold'), padx=10),
+            "Open the guide: getting started, what every setting does, "
+            "shortcuts  (F1)").pack(side=tk.RIGHT, padx=10)
 
         self._layout_info = tk.Label(toolbar, text=self._layout_info_text(),
                                      bg='#0d0d1a', fg='#888', font=('Helvetica', 8),
@@ -1302,8 +1609,14 @@ class App:
                   background=[('selected', '#0f3460')],
                   foreground=[('selected', 'white')])
 
+        # Hint line at the bottom (packed before the notebook so it keeps its space)
+        self.status = help_ui.StatusBar(root)
+        self.status.pack(side=tk.BOTTOM, fill=tk.X)
+        help_ui.Tooltip.status = self.status
+
         nb = ttk.Notebook(root)
         nb.pack(fill=tk.BOTH, expand=True)
+        self.nb = nb
 
         self.painter  = PainterTab(nb, self.ensure_layout)
         self.sim      = SimulatorTab(nb, self.painter.get_frames_data, self.ensure_layout)
@@ -1312,10 +1625,112 @@ class App:
         nb.add(self.painter.frame,  text="  🎨  Painter  ")
         nb.add(self.sim.frame,      text="  ▶   Simulator  ")
         nb.add(self.exporter.frame, text="  📄  Export .h  ")
+        self._tabs = [self.painter.frame, self.sim.frame, self.exporter.frame]
+        nb.bind('<<NotebookTabChanged>>', self._on_tab_changed)
+
+        # Help overlay, on top of everything else in the window
+        self.settings = help_ui.Settings()
+        self.help = help_ui.HelpOverlay(root, self.settings)
+        self._bind_shortcuts()
 
         fit_window_to_screen(root)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._mic_refresh()
+        self._on_tab_changed()
+        # The guide opens by itself the first time, then only if asked to
+        if self.settings.get('show_guide_at_start') or not self.settings.get('guide_seen'):
+            root.after(300, lambda: self.help.show(0))
+            self.settings.set('guide_seen', True)
+
+    # ── Tabs and hints ────────────────────────────────────────────────────────
+    TAB_HINTS = [
+        "Painter: click or drag on the face to paint, right-click to erase. "
+        "Hover over any button to see what it does.",
+        "Simulator: click Preview Painter Frames (or Open .anim), then ▶ Auto Play. "
+        "Move the volume slider to test sound reactions.",
+        "Export .h: only for building the firmware yourself. To use an animation, "
+        "save a .anim and copy it to the SD card.",
+    ]
+
+    def current_tab(self):
+        try:
+            return self._tabs.index(self.root.nametowidget(self.nb.select()))
+        except (ValueError, KeyError, tk.TclError):
+            return 0
+
+    def _on_tab_changed(self, _event=None):
+        tab = self.current_tab()
+        self.status.set_default(self.TAB_HINTS[tab])
+        if tab == 1:
+            self.sim.on_shown()
+
+    # ── Keyboard shortcuts (listed in help_ui.SHORTCUTS) ──────────────────────
+    _TYPING = ('Entry', 'Spinbox', 'Text', 'TEntry', 'TCombobox', 'TSpinbox')
+
+    def _bind_shortcuts(self):
+        mod = 'Command' if sys.platform == 'darwin' else 'Control'
+        P, S = 0, 1     # tab numbers
+
+        # One root binding per key; several tabs can use the same key
+        self._keymap = {}
+
+        def bind(seqs, fn, tab=None, letter=False):
+            for seq in seqs:
+                if seq not in self._keymap:
+                    self._keymap[seq] = []
+                    self.root.bind(seq, lambda e, seq=seq: self._shortcut(e, seq))
+                self._keymap[seq].append((fn, tab, letter))
+
+        def ctrl(key):
+            return [f'<{mod}-{key}>', f'<{mod}-{key.upper()}>']
+
+        def key(k):
+            return [f'<KeyPress-{k}>', f'<KeyPress-{k.upper()}>'] if k.isalpha() \
+                else [f'<KeyPress-{k}>']
+
+        self.root.bind('<F1>', lambda e: (self.help.toggle(), 'break')[1])
+        self.root.bind('<Escape>', lambda e: self.help.hide() if self.help.visible else None)
+        for i in range(3):
+            bind([f'<{mod}-Key-{i + 1}>'], lambda i=i: self.nb.select(i))
+
+        p = self.painter
+        bind(ctrl('z'), p.undo, P)
+        bind(ctrl('n'), p.new_frame, P)
+        bind(ctrl('d'), p.copy_frame, P)
+        bind(ctrl('o'), p._open_anim, P)
+        bind(ctrl('s'), p.save_anim, P)
+        bind(['<Left>'], p.prev_frame, P, letter=True)
+        bind(['<Right>'], p.next_frame, P, letter=True)
+        bind(key('e'), lambda: (p.eraser.set(not p.eraser.get()),
+                                p._update_brush_preview()), P, letter=True)
+        bind(key('m'), lambda: p.mirror.set(not p.mirror.get()) if _D.mirror else None,
+             P, letter=True)
+        bind(key('c'), p._pick_color, P, letter=True)
+        for i in range(len(SWATCHES)):
+            bind(key(str(i + 1)), lambda i=i: p.pick_swatch(i), P, letter=True)
+
+        s = self.sim
+        bind(['<space>'], s.toggle_play, S, letter=True)
+        bind(['<Left>'], s.prev_frame, S, letter=True)
+        bind(['<Right>'], s.next_frame, S, letter=True)
+        bind(key('p'), s.load_from_painter, S, letter=True)
+
+    def _shortcut(self, _event, seq):
+        if self.help.visible:
+            return None
+        focus = self.root.focus_get()
+        cls = focus.winfo_class() if focus is not None else ''
+        if cls in self._TYPING:
+            return None        # let the user type
+        tab = self.current_tab()
+        for fn, want_tab, letter in self._keymap[seq]:
+            if want_tab is not None and want_tab != tab:
+                continue
+            if letter and cls == 'Scale':
+                return None    # arrow keys move a selected slider
+            fn()
+            return 'break'
+        return None
 
     def _layout_info_text(self):
         D = _D
@@ -1328,6 +1743,7 @@ class App:
         cfg = DISPLAYS[self._display_var.get()]
         if cfg is _D:
             return
+        self.root.focus_set()     # so the shortcut keys go to the tool again
         if not messagebox.askyesno(
                 "Switch display?",
                 f"Switch to \"{cfg.name}\"?\n\n"
@@ -1398,6 +1814,8 @@ class App:
         self.root.after(33, self._mic_refresh)
 
     def _on_close(self):
+        if not self.painter.confirm_discard("closing"):
+            return
         self.sim.on_close()
         self.root.destroy()
 

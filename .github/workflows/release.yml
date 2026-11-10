@@ -3,9 +3,9 @@ name: Release
 # Builds the tool for Windows, macOS and Linux and publishes a GitHub release.
 # Start it by pushing a version tag (e.g. V3), or from the Actions tab with
 # "Run workflow" on main, entering the version — the tag is then created on
-# the current main commit. Run on dev, it makes a test prerelease (never
-# marked "latest"); the version must contain "-dev", e.g. V5-dev.1. A version
-# with a "-" in it is always a prerelease.
+# the current main commit. Run on dev, it makes a test build; the version must
+# contain "-dev", e.g. V5-dev.1. A version with a "-" in it becomes a DRAFT
+# prerelease: only repo members can see it, so the website never picks it up.
 #
 # Asset names must keep their Windows_ / Mac_ / Linux_ prefixes: the website's
 # download buttons find the files by those prefixes.

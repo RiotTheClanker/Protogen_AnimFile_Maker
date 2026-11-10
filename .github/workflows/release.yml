@@ -35,7 +35,9 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          # Oldest supported Ubuntu: the Linux build bundles the system's Tcl/Tk,
+          # which only runs on a glibc at least as old as the build machine's.
+          - os: ubuntu-22.04
             built: dist/protogen_tool
             asset: Linux_protogen_tool
           - os: macos-latest

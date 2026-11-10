@@ -24,6 +24,35 @@ V1_PANEL_COUNTS = (11, 14)
 V1_LEDS_PER_PANEL = 64
 
 SOUND_STATIC = 0
+SOUND_SNAP   = 1
+SOUND_LINEAR = 2
+TIMING_TIMED = 0
+TIMING_SOUND = 1
+
+# SOUND-timed frames advance when the volume rises through this level
+# (after being held for at least duration_ms).  Must match the firmware's
+# SOUND_TRIGGER_LEVEL / SOUND_TRIGGER_RELEASE.
+SOUND_TRIGGER_LEVEL   = 128
+SOUND_TRIGGER_RELEASE = 96
+
+
+def apply_sound(led, vol):
+    """(r, g, b) an LED shows at volume `vol` (0-255), as the firmware does."""
+    r, g, b, sm, param = led
+    if sm == SOUND_STATIC:
+        return r, g, b
+    elif sm == SOUND_SNAP:
+        return (r, g, b) if vol >= param else (0, 0, 0)
+    elif sm == SOUND_LINEAR:
+        m     = (param >> 4) & 0x0F
+        bv    = param & 0x0F
+        scale = max(0.0, min(1.0, (m * vol / 255.0) + (bv / 15.0)))
+        return int(r * scale), int(g * scale), int(b * scale)
+    return r, g, b
+
+
+def pack_linear(m, b):
+    return (max(0, min(15, int(m))) << 4) | max(0, min(15, int(b)))
 
 
 def blank_led():

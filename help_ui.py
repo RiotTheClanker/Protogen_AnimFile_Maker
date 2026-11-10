@@ -14,6 +14,8 @@ and **text** is bold.
 import json, os, sys
 import tkinter as tk
 
+import help_demos
+
 BG      = '#0d0d1a'
 CARD_BG = '#1a1a2e'
 PANEL   = '#16213e'
@@ -183,6 +185,10 @@ SHORTCUTS = [
 # ── Help text ─────────────────────────────────────────────────────────────────
 HELP_TOPICS = [
     ("Getting started", """\
+## New here? Start with "How it works"
+It shows, with live examples, what a pixel is, how sound-reactive pixels work and how frames make an animation. Or load an example animation and look at how it's made:
+[[button:load_example:Load the example animation into the Painter]]
+
 ## Make your first animation in 5 steps
 **1. Pick your display.**  Use the **Display** menu at the top. It has to match the helmet the firmware is set up for (Mk2 is the default). If you have a different display, click **Open display.json…**.
 **2. Paint a face.**  On the **🎨 Painter** tab, pick a colour on the right, then click or drag on the face. **Right-click** erases. **Mirror to other side** is on, so the other half of the face is painted for you.
@@ -197,9 +203,30 @@ HELP_TOPICS = [
 • The timing settings belong to the **frame you're on**. Every frame has its own.
 • You can open this guide again any time with **F1** or the **? Help** button.
 """),
+    ("How it works", """\
+## 1. Pixels
+The face is made of LED panels, and each square in the Painter is **one LED** (one pixel). An 8 × 8 panel has 64 of them; a Mk2 helmet has 11 panels, 704 LEDs in all. You paint each LED one by one.
+[[demo:pixels]]
+
+## 2. Sound reaction
+Every LED can react to the helmet's microphone in one of three ways. You choose it in **Sound reaction** before you paint, the same way you choose the colour. The LEDs you paint get that reaction.
+[[demo:sound]]
+So a mouth that "talks" can be a single frame: paint the closed mouth **Static**, and the open part around it **Snap**. When you talk, the Snap LEDs light up and the mouth opens.
+
+## 3. Frames make the animation
+[[demo:frames]]
+• Each frame is a whole picture of the face. Use **Duplicate**, then change a few LEDs, to make the next one.
+• **Timed** frames play by themselves, like a blink. **Sound triggered** frames move on each time you make a loud sound.
+• You can mix both: LEDs that react to sound **inside** frames that play on a timer.
+
+## 4. See a real one
+The example animation blinks (2 Timed frames), has a Snap mouth that opens when you talk, and a Linear nose that glows with your voice. Load it, hover over its LEDs to see their settings, and play it in the Simulator.
+[[button:load_example:Load the example animation into the Painter]]
+"""),
     ("Painting", """\
 ## The face
-The face is drawn the way it's laid out on the helmet. Each square is one LED. Coloured boxes mark the regions (eyes, mouth, nose) and their names. When you move the pointer over the face, the bar at the bottom says which panel and pixel you're on.
+The face is drawn the way it's laid out on the helmet. Each square is one LED. Coloured boxes mark the regions (eyes, mouth, nose) and their names. When you move the pointer over the face, the bar at the bottom says which panel and pixel you're on, and the LED's colour and sound reaction.
+LEDs marked **S** react with Snap and **L** with Linear; unmarked lit LEDs are Static. Untick **Show S / L marks** to hide the letters.
 
 ## Brush
 • **Colour**: click a swatch, or **Pick Color…** for any colour.
@@ -225,7 +252,8 @@ The helmet has a microphone. Each LED can react to how loud it is. Choose the re
 • **Linear (brighter when louder)**: the LED fades in with the volume. **b** is how bright it is when it's silent (0 = off, 15 = full). **m** is how fast it gets brighter: m = 1 fades in slowly over the whole volume range, and a high m like 12 is fully bright as soon as there's some sound.
 
 ## Try it
-Paint some Snap LEDs, then open the **▶ Simulator**, click **Preview Painter Frames**, and move the **volume** slider (or turn on the mic). You'll see exactly what the helmet would do.
+[[demo:sound]]
+In the Painter, LEDs marked **S** are Snap and **L** are Linear; hovering over one shows its setting in the bar at the bottom. Paint some Snap LEDs, then open the **▶ Simulator**, click **Preview Painter Frames**, and move the **volume** slider (or turn on the mic). You'll see exactly what the helmet would do.
 """),
     ("Frame timing", """\
 ## How long each frame stays on
@@ -235,6 +263,7 @@ Every frame has its own timing. The settings show the frame you're on.
 • **Sound triggered**: the frame stays until there's a loud sound (the volume goes past 128), then the next frame comes. The time you set is the **shortest** it stays on, so one sound can't skip through many frames.
 
 After the last frame, the animation starts again from frame 1.
+[[demo:frames]]
 
 ## Tip
 To make a face blink now and then: frame 1 with open eyes, Timed, 3000 ms. Frame 2 with half-closed eyes, 80 ms. Frame 3 with closed eyes, 120 ms. Frame 4 like frame 2, 80 ms.
@@ -292,9 +321,11 @@ class HelpOverlay:
     The guide, drawn on top of the whole window: topics on the left, text on
     the right.  F1, Esc or the Close button hide it.
     """
-    def __init__(self, root, settings):
+    def __init__(self, root, settings, actions=None):
         self.root     = root
         self.settings = settings
+        self.actions  = actions or {}     # [[button:name:…]] → callable
+        self._embedded = []               # demos and buttons in the text
         self.visible  = False
         self._topic   = 0
 
@@ -364,13 +395,17 @@ class HelpOverlay:
         if topic is not None:
             self.show_topic(topic)
         elif not self.text.get('1.0', 'end-1c'):
-            self.show_topic(0)
+            self.show_topic(self._topic)
         self.frame.place(x=0, y=0, relwidth=1, relheight=1)
         self.frame.lift()
         self.frame.focus_set()
         self.visible = True
 
     def hide(self):
+        self._clear_embedded()
+        self.text.config(state=tk.NORMAL)
+        self.text.delete('1.0', tk.END)   # re-rendered (demos restarted) on show
+        self.text.config(state=tk.DISABLED)
         self.frame.place_forget()
         self.visible = False
 
@@ -395,6 +430,7 @@ class HelpOverlay:
         for k, b in enumerate(self._nav_buttons):
             b.config(bg=KEY_BG if k == i else PANEL)
         title, body = HELP_TOPICS[i]
+        self._clear_embedded()
         self.text.config(state=tk.NORMAL)
         self.text.delete('1.0', tk.END)
         if body is None:
@@ -412,9 +448,39 @@ class HelpOverlay:
             if part:
                 self.text.insert(tk.END, part, tags + (('b',) if k % 2 else ()))
 
+    def _clear_embedded(self):
+        for w in self._embedded:
+            if hasattr(w, 'stop'):
+                w.stop()
+            w.destroy()
+        self._embedded = []
+
+    def _embed(self, spec):
+        """[[demo:name]] or [[button:action:Label]] → a widget in the text."""
+        kind, _, rest = spec.partition(':')
+        if kind == 'demo' and rest in help_demos.DEMOS:
+            w = help_demos.DEMOS[rest](self.text)
+        elif kind == 'button':
+            name, _, label = rest.partition(':')
+            action = self.actions.get(name)
+            if action is None:
+                return
+            w = tk.Button(self.text, text=label, bg=ACCENT, fg='white', padx=12, pady=4,
+                          font=('Helvetica', 10, 'bold'), cursor='hand2',
+                          command=lambda a=action: self.root.after_idle(
+                              lambda: (self.hide(), a())))
+        else:
+            return
+        self._embedded.append(w)
+        self.text.insert(tk.END, '  ')
+        self.text.window_create(tk.END, window=w, padx=4, pady=6)
+        self.text.insert(tk.END, '\n')
+
     def _render(self, body):
         for line in body.splitlines():
-            if line.startswith('## '):
+            if line.startswith('[[') and line.endswith(']]'):
+                self._embed(line[2:-2])
+            elif line.startswith('## '):
                 self.text.insert(tk.END, line[3:] + '\n', ('h',))
             elif line.startswith('• '):
                 self._insert_inline(line, ('bullet',))

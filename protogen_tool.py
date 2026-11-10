@@ -27,9 +27,12 @@ import numpy as np
 
 import display_config as dcfg
 from anim_io import (read_anim, write_anim, remap_leds, blank_led, blank_leds,
-                     SOUND_STATIC)
+                     apply_sound, pack_linear,
+                     SOUND_STATIC, SOUND_SNAP, SOUND_LINEAR, TIMING_TIMED, TIMING_SOUND,
+                     SOUND_TRIGGER_LEVEL, SOUND_TRIGGER_RELEASE)
 import help_ui
 from help_ui import tip
+from help_demos import mode_text
 
 try:
     import pyaudio
@@ -38,17 +41,6 @@ except ImportError:
     PYAUDIO_OK = False
 
 # ── Fixed constants ───────────────────────────────────────────────────────────
-SOUND_SNAP   = 1
-SOUND_LINEAR = 2
-TIMING_TIMED = 0
-TIMING_SOUND = 1
-
-# SOUND-timed frames advance when the volume rises through this level
-# (after being held for at least duration_ms).  Must match the firmware's
-# SOUND_TRIGGER_LEVEL / SOUND_TRIGGER_RELEASE.
-SOUND_TRIGGER_LEVEL   = 128
-SOUND_TRIGGER_RELEASE = 96
-
 DEFAULT_DISPLAY = 'Mk2'   # matches the ProtoFace firmware default
 
 # ── Display configs ───────────────────────────────────────────────────────────
@@ -69,9 +61,6 @@ def TOTAL_LEDS():
     return _D.total_pixels
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
-def pack_linear(m, b):
-    return (max(0, min(15, int(m))) << 4) | max(0, min(15, int(b)))
-
 def blank_led_list(n=None):
     return blank_leds(TOTAL_LEDS() if n is None else n)
 
@@ -110,8 +99,83 @@ def describe_pixel(flat):
             return f"{where}  ·  panel {p.id}  ·  x {x}, y {y}"
     return ''
 
+def describe_led(led):
+    """'#00ffff · Snap: on when the volume is 128 or more', or 'off'."""
+    if not any(led[:3]):
+        return "off (black)"
+    return f"{hex_color(led[:3])}  ·  {mode_text(led)}"
+
 def frame_is_lit(leds):
     return any(led[0] or led[1] or led[2] for led in leds)
+
+
+# ── Example animation ─────────────────────────────────────────────────────────
+def _example_regions(cfg):
+    """[(kind, x0, y0, x1, y1)] boxes in display pixels to draw the example in."""
+    boxes = {}
+    for p in cfg.panels:
+        if p.region in ('eye', 'mouth', 'nose'):
+            key = (p.side, p.region)
+            x0, y0, x1, y1 = boxes.get(key, (p.x, p.y, p.x + p.w, p.y + p.h))
+            boxes[key] = (min(x0, p.x), min(y0, p.y), max(x1, p.x + p.w), max(y1, p.y + p.h))
+    if any(r == 'eye' for _s, r in boxes) and any(r == 'mouth' for _s, r in boxes):
+        return [(r, *box) for (_s, r), box in boxes.items()]
+    # No eye / mouth regions (one big panel, say): draw a face across the display
+    out = []
+    sides = sorted({p.side for p in cfg.panels if p.side}) or [None]
+    for side in sides:
+        ps = [p for p in cfg.panels if p.side == side] if side else list(cfg.panels)
+        x0, y0 = min(p.x for p in ps), min(p.y for p in ps)
+        x1, y1 = max(p.x + p.w for p in ps), max(p.y + p.h for p in ps)
+        w, h = x1 - x0, y1 - y0
+        eyes = [(0.15, 0.4)] if len(sides) > 1 else [(0.1, 0.4), (0.6, 0.9)]
+        for a, b in eyes:
+            out.append(('eye', x0 + a * w, y0 + 0.08 * h, x0 + b * w, y0 + 0.5 * h))
+        out.append(('mouth', x0 + 0.1 * w, y0 + 0.6 * h, x0 + 0.9 * w, y0 + 0.95 * h))
+    return out
+
+
+def make_example(cfg):
+    """A two-frame example for any display: the eyes blink (Timed frames),
+    the mouth opens when you talk (Snap) and the nose glows with your voice
+    (Linear).  Returns (frames, frame_meta)."""
+    cyan = (0, 255, 255)
+    static = [*cyan, SOUND_STATIC, 0]
+    snap = [*cyan, SOUND_SNAP, 90]
+    glow = [255, 120, 200, SOUND_LINEAR, pack_linear(3, 2)]
+    regions = _example_regions(cfg)
+
+    def led_for(kind, u, v, eyes_open):
+        if kind == 'eye':
+            if eyes_open:
+                return static if ((u - 0.5) / 0.45) ** 2 + ((v - 0.5) / 0.42) ** 2 <= 1 else None
+            return static if abs(v - 0.6) < 0.1 and abs(u - 0.5) < 0.45 else None
+        if kind == 'mouth':
+            if abs(v - 0.5) < 0.09 and 0.03 < u < 0.97:
+                return static                     # closed mouth line
+            open_h = 0.42 * (1 - (2 * u - 1) ** 2)
+            return snap if abs(v - 0.5) < open_h else None   # opens when loud
+        if kind == 'nose':
+            return glow if abs(u - 0.5) < 0.35 * (1 - v) + 0.05 and 0.2 < v < 0.8 else None
+        return None
+
+    frames = []
+    for eyes_open in (True, False):
+        leds = blank_leds(cfg.total_pixels)
+        for p in cfg.panels:
+            for i, (px, py) in enumerate(p.pixels):
+                X, Y = p.x + px + 0.5, p.y + py + 0.5
+                for kind, x0, y0, x1, y1 in regions:
+                    if x0 <= X < x1 and y0 <= Y < y1:
+                        led = led_for(kind, (X - x0) / (x1 - x0), (Y - y0) / (y1 - y0),
+                                      eyes_open)
+                        if led is not None:
+                            leds[p.offset + i] = list(led)
+                        break
+        frames.append(leds)
+    meta = [{'duration_ms': 2500, 'timing_mode': TIMING_TIMED},
+            {'duration_ms': 150, 'timing_mode': TIMING_TIMED}]
+    return frames, meta
 
 # Quick colour swatches in the Painter (keys 1-8)
 SWATCHES = [(255, 255, 255), (255, 0, 0), (255, 128, 0), (255, 255, 0),
@@ -318,21 +382,6 @@ class MicMonitor:
             except Exception:
                 break
 
-# ── Sound reaction helper ─────────────────────────────────────────────────────
-def apply_sound(led, vol):
-    r, g, b, sm, param = led
-    if sm == SOUND_STATIC:
-        return r, g, b
-    elif sm == SOUND_SNAP:
-        return (r, g, b) if vol >= param else (0, 0, 0)
-    elif sm == SOUND_LINEAR:
-        m     = (param >> 4) & 0x0F
-        bv    = param & 0x0F
-        scale = max(0.0, min(1.0, (m * vol / 255.0) + (bv / 15.0)))
-        return int(r * scale), int(g * scale), int(b * scale)
-    return r, g, b
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # TAB 1 – Painter
 # ─────────────────────────────────────────────────────────────────────────────
@@ -359,6 +408,8 @@ class PainterTab:
         self.eraser      = tk.BooleanVar(value=False)
         self.mirror      = tk.BooleanVar(value=True)
         self.flip        = tk.BooleanVar(value=self._default_flip())
+        self.show_marks  = tk.BooleanVar(value=True)
+        self._marks      = {}     # flat → S / L text item on the canvas
         self._erasing    = False  # right-button stroke in progress
 
         self._build_canvas()
@@ -488,6 +539,9 @@ class PainterTab:
             "Make the other side a mirror image, like a real face.  Leave it on "
             "for Mk2 and Mk3.  If the right side is backwards on the helmet, "
             "turn it off.", state=state)
+        check("Show S / L marks on sound LEDs", self.show_marks,
+              "Mark LEDs that react to sound: S = Snap, L = Linear. Unmarked lit "
+              "LEDs are Static (always on).", command=self._draw_all)
 
         # Sound
         section("SOUND REACTION", "How the LEDs you paint next react to the mic.")
@@ -574,6 +628,10 @@ class PainterTab:
         tip(tk.Button(ctrl, text="Save .anim", command=self.save_anim,
                       bg='#0f3460', fg='white'),
             "Save all frames as a .anim file for the SD card  (Ctrl+S)").pack(fill=tk.X, pady=2)
+        tip(tk.Button(ctrl, text="Load example", command=self.load_example,
+                      bg='#0f3460', fg='white'),
+            "Load a small example animation (blink, talking mouth, glowing nose) "
+            "to see how one is made").pack(fill=tk.X, pady=2)
         tip(tk.Button(ctrl, text="Clear Frame", command=self.clear_frame,
                       bg='#3d0000', fg='white'),
             "Turn every LED in this frame off").pack(fill=tk.X, pady=2)
@@ -643,6 +701,9 @@ class PainterTab:
             self._canvas_items[flat] = item
             self._item_to_flat[item] = flat
 
+        self._marks.clear()
+        for flat in self._canvas_items:
+            self._update_mark(flat)
         draw_region_outlines(self.canvas, self._fit.rects)
         self.frame_label.config(text=f"Frame {self.current+1}/{len(self.frames)}")
 
@@ -651,6 +712,24 @@ class PainterTab:
             return
         r, g, b = self.frames[self.current][flat][:3]
         self.canvas.itemconfig(self._canvas_items[flat], fill=hex_color((r, g, b)))
+        self._update_mark(flat)
+
+    def _update_mark(self, flat):
+        """Letter on a sound-reactive LED: S = Snap, L = Linear."""
+        old = self._marks.pop(flat, None)
+        if old is not None:
+            self.canvas.delete(old)
+        if not self.show_marks.get() or self._fit.cell < 9:
+            return
+        led = self.frames[self.current][flat]
+        if led[3] not in (SOUND_SNAP, SOUND_LINEAR) or not any(led[:3]):
+            return
+        x1, y1, x2, y2 = self._fit.rects[flat]
+        bright = led[0] * 299 + led[1] * 587 + led[2] * 114 > 128000
+        self._marks[flat] = self.canvas.create_text(
+            (x1 + x2) / 2, (y1 + y2) / 2, text='S' if led[3] == SOUND_SNAP else 'L',
+            fill='#000' if bright else '#fff', state=tk.DISABLED,
+            font=('Helvetica', max(6, self._fit.cell // 2), 'bold'))
 
     # ── Undo ──────────────────────────────────────────────────────────────────
     # Two kinds of entry:
@@ -731,7 +810,8 @@ class PainterTab:
         if flat is None:
             self._status_clear()
         else:
-            self._status_show(describe_pixel(flat))
+            self._status_show(f"{describe_pixel(flat)}   |   "
+                              f"{describe_led(self.frames[self.current][flat])}")
 
     def _on_paint(self, event):
         flat = self._flat_at(event)
@@ -896,6 +976,27 @@ class PainterTab:
             messagebox.showinfo("Opened", f"Loaded {len(self.frames)} frames from\n{path}")
         except Exception as e:
             messagebox.showerror("Error", str(e))
+
+    def load_example(self):
+        if not self.confirm_discard("loading the example"):
+            return
+        self.frames, self.frame_meta = make_example(_D)
+        self.current = 0
+        self._undo.clear()
+        self._load_meta()
+        self._draw_all()
+        self.dirty = False
+        messagebox.showinfo(
+            "Example loaded",
+            "The example has 2 frames:\n\n"
+            "• Frame 1: eyes open, shown for 2500 ms (Timed).\n"
+            "• Frame 2: eyes closed, 150 ms. Together they make a blink.\n\n"
+            "The mouth's S LEDs are Snap: they only light up when you talk, so "
+            "the mouth opens. The nose's L LEDs are Linear: they glow brighter "
+            "the louder you are.\n\n"
+            "Hover over the LEDs to see their settings, and use Next ▶ to see "
+            "frame 2. Then open the Simulator, press ▶ Auto Play and move the "
+            "volume slider.")
 
     def save_anim(self):
         """Save to a file the user picks.  Returns True if it was saved."""
@@ -1630,7 +1731,8 @@ class App:
 
         # Help overlay, on top of everything else in the window
         self.settings = help_ui.Settings()
-        self.help = help_ui.HelpOverlay(root, self.settings)
+        self.help = help_ui.HelpOverlay(root, self.settings, actions={
+            'load_example': lambda: (self.nb.select(0), self.painter.load_example())})
         self._bind_shortcuts()
 
         fit_window_to_screen(root)

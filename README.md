@@ -23,6 +23,18 @@ builds all three platforms and publishes `Windows_protogen_tool.exe`, `Mac_proto
 The window opens sized to fit your screen and can be resized: the face scales to fill the
 space, and the control columns scroll (scrollbar or mouse wheel) when the window is short.
 
+## New to the tool?
+
+Press **F1** (or the **? Help** button) for the built-in guide. It opens by itself the first
+time you start the tool and covers making a first animation step by step, what every setting
+does, the keyboard shortcuts and common problems. Hover over any button to see what it does;
+the bar at the bottom of the window shows the same hint. **Ctrl+Z** undoes the last stroke,
+fill, clear or frame change, and right-click erases.
+
+In short: pick your display, paint a frame, **Duplicate** it and change it a little, check it
+in the Simulator, then **Save .anim** and copy it to the root of the helmet's SD card. Name it
+`start.anim` to play it when the helmet turns on.
+
 ## Displays
 
 Pick the display in the toolbar. It **must match the display the firmware is set up for**.

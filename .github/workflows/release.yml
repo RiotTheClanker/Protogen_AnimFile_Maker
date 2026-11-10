@@ -1,6 +1,7 @@
 name: Release
 
-# Builds the tool for Windows, macOS and Linux and publishes a GitHub release.
+# Builds the tool for Windows, macOS and Linux and publishes a GitHub release;
+# each file is added as soon as its build finishes.
 # Start it by pushing a version tag (e.g. V3), or from the Actions tab with
 # "Run workflow" on main, entering the version — the tag is then created on
 # the current main commit. Run on dev, it makes a test build; the version must
@@ -25,13 +26,49 @@ env:
   VERSION: ${{ inputs.version || github.ref_name }}
 
 jobs:
-  build:
-    name: Build ${{ matrix.asset }}
+  # Creates the release first (or finds one made by hand), so each build can
+  # add its file the moment it finishes: a slow macOS queue no longer holds
+  # back the Windows and Linux downloads.
+  release:
+    name: Create release
     # Manual releases only from main (release) or dev (prerelease)
     if: >-
       github.event_name == 'push' || github.ref == 'refs/heads/main' ||
       (github.ref == 'refs/heads/dev' && contains(inputs.version, '-dev'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A release made by hand on the Releases page (which also pushes the
+          # tag and starts this workflow) already exists: keep its title and
+          # notes, the builds just add their files to it.
+          if gh release view "$VERSION" >/dev/null 2>&1; then exit 0; fi
+          case "$VERSION" in
+            *-*) pre=true; set -- --draft --prerelease --latest=false ;;
+            *)   pre=false; set -- ;;
+          esac
+          notes="docs/releases/${VERSION}.md"
+          if [ -f "$notes" ]; then set -- "$@" --notes-file "$notes"
+          elif $pre && [ -f docs/releases/dev.md ]; then set -- "$@" --notes-file docs/releases/dev.md
+          else set -- "$@" --generate-notes; fi
+          # --target creates the tag on this commit when it doesn't exist yet
+          # (manual runs); for a pushed tag it already points here.
+          gh release create "$VERSION" \
+            --title "Protogen Animation Tool ${VERSION}" \
+            --target "$GITHUB_SHA" "$@"
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: release
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     strategy:
       matrix:
         include:
@@ -81,41 +118,9 @@ jobs:
           path: out/${{ matrix.asset }}
           if-no-files-found: error
 
-  publish:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: release-*
-          path: out
-          merge-multiple: true
-
-      - name: Publish release
+      - name: Add to the release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          # A release made by hand on the Releases page (which also pushes the
-          # tag and starts this workflow) already exists: add the files to it
-          # instead of failing, and keep its title and notes.
-          if gh release view "$VERSION" >/dev/null 2>&1; then
-            gh release upload "$VERSION" out/* --clobber
-            exit 0
-          fi
-          case "$VERSION" in
-            *-*) pre=true; set -- --draft --prerelease --latest=false ;;
-            *)   pre=false; set -- ;;
-          esac
-          notes="docs/releases/${VERSION}.md"
-          if [ -f "$notes" ]; then set -- "$@" --notes-file "$notes"
-          elif $pre && [ -f docs/releases/dev.md ]; then set -- "$@" --notes-file docs/releases/dev.md
-          else set -- "$@" --generate-notes; fi
-          # --target creates the tag on this commit when it doesn't exist yet
-          # (manual runs); for a pushed tag it already points here.
-          gh release create "$VERSION" out/* \
-            --title "Protogen Animation Tool ${VERSION}" \
-            --target "$GITHUB_SHA" "$@"
+        run: gh release upload "$VERSION" "out/${{ matrix.asset }}" --clobber
+

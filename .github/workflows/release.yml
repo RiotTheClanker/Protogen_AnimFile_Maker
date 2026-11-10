@@ -3,7 +3,9 @@ name: Release
 # Builds the tool for Windows, macOS and Linux and publishes a GitHub release.
 # Start it by pushing a version tag (e.g. V3), or from the Actions tab with
 # "Run workflow" on main, entering the version — the tag is then created on
-# the current main commit.
+# the current main commit. Run on dev, it makes a test build; the version must
+# contain "-dev", e.g. V5-dev.1. A version with a "-" in it becomes a DRAFT
+# prerelease: only repo members can see it, so the website never picks it up.
 #
 # Asset names must keep their Windows_ / Mac_ / Linux_ prefixes: the website's
 # download buttons find the files by those prefixes.
@@ -13,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to release (e.g. V3)'
+        description: 'Version (main: e.g. V5; dev: e.g. V5-dev.1)'
         required: true
 
 permissions:
@@ -25,8 +27,10 @@ env:
 jobs:
   build:
     name: Build ${{ matrix.asset }}
-    # Manual releases only from main
-    if: github.event_name == 'push' || github.ref == 'refs/heads/main'
+    # Manual releases only from main (release) or dev (prerelease)
+    if: >-
+      github.event_name == 'push' || github.ref == 'refs/heads/main' ||
+      (github.ref == 'refs/heads/dev' && contains(inputs.version, '-dev'))
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -100,8 +104,14 @@ jobs:
             gh release upload "$VERSION" out/* --clobber
             exit 0
           fi
+          case "$VERSION" in
+            *-*) pre=true; set -- --draft --prerelease --latest=false ;;
+            *)   pre=false; set -- ;;
+          esac
           notes="docs/releases/${VERSION}.md"
-          if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --generate-notes; fi
+          if [ -f "$notes" ]; then set -- "$@" --notes-file "$notes"
+          elif $pre && [ -f docs/releases/dev.md ]; then set -- "$@" --notes-file docs/releases/dev.md
+          else set -- "$@" --generate-notes; fi
           # --target creates the tag on this commit when it doesn't exist yet
           # (manual runs); for a pushed tag it already points here.
           gh release create "$VERSION" out/* \

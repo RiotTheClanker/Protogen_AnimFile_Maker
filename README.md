@@ -15,7 +15,7 @@ Prebuilt Windows / macOS / Linux executables are on the
 
 ### Releasing
 
-Add notes as `docs/releases/<version>.md`, then either push a tag (`git tag V4 && git push origin V4`)
+Add notes as `docs/releases/<version>.md`, then either push a tag (`git tag V5 && git push origin V5`)
 or open **Actions → Release → Run workflow** on `main` and enter the version. The workflow
 builds all three platforms and publishes `Windows_protogen_tool.exe`, `Mac_protogen_tool` and
 `Linux_protogen_tool`. Keep those names, because the website's download buttons find the files by them.
@@ -41,8 +41,8 @@ Pick the display in the toolbar. It **must match the display the firmware is set
 The **Mk2** (default) and **Mk3** presets ship with the tool; **Open display.json…** loads
 any other display config, such as a HUB75 panel, a chain of MAX7219 8×8 matrices or a custom
 NeoPixel PCB. The format is documented in
-[ProtoFace `docs/display-config.md`](https://github.com/RiotTheClanker/ProtoFace/blob/dev/docs/display-config.md),
-with examples in [`displays/examples/`](https://github.com/RiotTheClanker/ProtoFace/tree/dev/displays/examples).
+[ProtoFace `docs/display-config.md`](https://github.com/RiotTheClanker/ProtoFace/blob/master/docs/display-config.md),
+with examples in [`displays/examples/`](https://github.com/RiotTheClanker/ProtoFace/tree/master/displays/examples).
 Check a config from the command line with `python display_config.py my_display.json`.
 
 | Display | Left side | Right side |
@@ -56,8 +56,7 @@ your artwork, matched panel by panel (eyes → eyes, mouth → mouth, nose → n
 
 Files for Mk2 and Mk3 are saved in the same format as before, so released ProtoFace
 firmware plays them. Files for other displays use a version 2 header that records the
-display's pixel count and layout ID; they need firmware with display-config support, which
-is still being built on the `dev` branch.
+display's pixel count and layout ID; they need ProtoFace V7.0 or newer.
 
 ## Tabs
 

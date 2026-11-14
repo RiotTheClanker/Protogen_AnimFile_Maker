@@ -15,7 +15,7 @@ Prebuilt Windows / macOS / Linux executables are on the
 
 ### Releasing
 
-Add notes as `docs/releases/<version>.md`, then either push a tag (`git tag V4 && git push origin V4`)
+Add notes as `docs/releases/<version>.md`, then either push a tag (`git tag V5 && git push origin V5`)
 or open **Actions → Release → Run workflow** on `main` and enter the version. The workflow
 builds all three platforms and publishes `Windows_protogen_tool.exe`, `Mac_protogen_tool` and
 `Linux_protogen_tool`. Keep those names, because the website's download buttons find the files by them.
@@ -23,19 +23,40 @@ builds all three platforms and publishes `Windows_protogen_tool.exe`, `Mac_proto
 The window opens sized to fit your screen and can be resized: the face scales to fill the
 space, and the control columns scroll (scrollbar or mouse wheel) when the window is short.
 
-## Layouts
+## New to the tool?
 
-Choose the layout in the toolbar. It **must match `PROTOGEN_LAYOUT` in the firmware**
-(the firmware defaults to 11).
+Press **F1** (or the **? Help** button) for the built-in guide. It opens by itself the first
+time you start the tool and covers making a first animation step by step, what every setting
+does, the keyboard shortcuts and common problems. Hover over any button to see what it does;
+the bar at the bottom of the window shows the same hint. **Ctrl+Z** undoes the last stroke,
+fill, clear or frame change, and right-click erases.
 
-| Layout | Side 1 — left chain (GP2) | Side 2 — right chain (GP3) |
+In short: pick your display, paint a frame, **Duplicate** it and change it a little, check it
+in the Simulator, then **Save .anim** and copy it to the root of the helmet's SD card. Name it
+`start.anim` to play it when the helmet turns on.
+
+## Displays
+
+Pick the display in the toolbar. It **must match the display the firmware is set up for**.
+The **Mk2** (default) and **Mk3** presets ship with the tool; **Open display.json…** loads
+any other display config, such as a HUB75 panel, a chain of MAX7219 8×8 matrices or a custom
+NeoPixel PCB. The format is documented in
+[ProtoFace `docs/display-config.md`](https://github.com/RiotTheClanker/ProtoFace/blob/master/docs/display-config.md),
+with examples in [`displays/examples/`](https://github.com/RiotTheClanker/ProtoFace/tree/master/displays/examples).
+Check a config from the command line with `python display_config.py my_display.json`.
+
+| Display | Left side | Right side |
 |---|---|---|
-| **11** (default) | Nose side: eyes, 3 mouth panels, nose | Plain side: eyes, 3 mouth panels |
-| **14** | Eyes, 4 mouth panels, nose | Eyes, 4 mouth panels, nose |
+| **Mk2** (default) | Eyes, 3 mouth panels, nose | Eyes, 3 mouth panels |
+| **Mk3** | Eyes, 4 mouth panels, nose | Eyes, 4 mouth panels, nose |
 
-Both sides are drawn in the Painter and Simulator: side 1 on top, side 2 underneath.
-Opening a file made for the other layout offers to switch layouts. Switching layouts
-keeps your artwork, matched panel by panel (eyes → eyes, mouth → mouth, nose → nose).
+Each region (eye, mouth, nose …) is outlined and gets a fill button. Opening a file made for
+another display offers to switch to it, or to open its display.json. Switching displays keeps
+your artwork, matched panel by panel (eyes → eyes, mouth → mouth, nose → nose).
+
+Files for Mk2 and Mk3 are saved in the same format as before, so released ProtoFace
+firmware plays them. Files for other displays use a version 2 header that records the
+display's pixel count and layout ID; they need ProtoFace V7.0 or newer.
 
 ## Tabs
 
@@ -45,9 +66,10 @@ keeps your artwork, matched panel by panel (eyes → eyes, mouth → mouth, nose
   - *Linear* — brightness = m × volume + b
 
   **Mirror to other side** (on by default) paints the same pixel on the matching panel of
-  the other side. **Copy side 1 → side 2** copies a whole side. Without one of these,
-  side 2 (the right-hand LED chain) stays black.
-  Tick **Flip left↔right when mirroring** if side 2 should be a mirror image of side 1:
+  the other side. **Copy left → right** copies a whole side. Without one of these, the
+  right side stays black. The display config says which sides mirror each other.
+  **Flip left↔right when mirroring** (its default comes from the display config; on for
+  Mk2 and Mk3, whose right-side panels are mounted mirrored) makes side 2 a mirror image:
   pixels are flipped horizontally and the panel order within each region is reversed
   (left eye ↔ right eye, first mouth panel ↔ last). Leave it off if both sides should show
   the same image in the same orientation. Which one you need depends on how the panels are
@@ -57,8 +79,8 @@ keeps your artwork, matched panel by panel (eyes → eyes, mouth → mouth, nose
   volume rises past 128, after at least `duration_ms`).
 - **▶ Simulator** — plays a `.anim` file or the Painter frames, following the same timing and
   sound rules as the firmware. Use the volume slider or your microphone.
-- **📄 Export .h** — turns one frame into `fallback_anim.h`. Copy it to `ProtoFace/src/`
-  and rebuild the firmware. The preview shows how many LEDs are lit on each side, so an
+- **📄 Export .h** — turns one frame into `fallback_anim.h` for the selected display. Copy
+  it to `ProtoFace/src/` and rebuild the firmware. The preview shows how many LEDs are lit on each side, so an
   empty side is easy to spot before exporting.
 
 ## File format
